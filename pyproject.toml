@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "creatify_as"
+version = "0.1.0"
+description = "In-memory AWS service simulators for Creatify tests (AppStream, DynamoDB)."
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.41",
+  "botocore>=1.41",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
