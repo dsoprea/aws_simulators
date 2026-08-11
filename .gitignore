@@ -1,3 +1,5 @@
 /build/
 /src/creatify_as.egg-info/
 
+__pycache__/
+
