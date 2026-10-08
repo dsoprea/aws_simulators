@@ -12,7 +12,7 @@ import creatify_as.dynamodb.simulator
 _AWA_FLEETS_TABLE_NAME = "awa_fleets"
 _AWA_STACKS_TABLE_NAME = "awa_stacks"
 _AWA_ASSOCIATIONS_STUDENT_TABLE_NAME = "awa_associations_student"
-_AWA_ASSOCIATIONS_STUDENT_QUEUE_TABLE_NAME = "awa_associations_student_queue"
+_AWA_ASSOCIATIONS_STUDENT_EVENT_TRACKING_QUEUE_TABLE_NAME = "awa_associations_student_event_tracking_queue"
 _AWA_STACKS_QUEUE_TABLE_NAME = "awa_stacks_queue"
 
 _FLEET_STATUS_AVAILABLE = "available"
@@ -28,14 +28,14 @@ _TEST_DYNAMODB_SIMULATOR_CONFIG = creatify_as.dynamodb.simulator.DynamoDbSimulat
     _AWA_FLEETS_TABLE_NAME,
     _AWA_STACKS_TABLE_NAME,
     _AWA_ASSOCIATIONS_STUDENT_TABLE_NAME,
-    _AWA_ASSOCIATIONS_STUDENT_QUEUE_TABLE_NAME,
+    _AWA_ASSOCIATIONS_STUDENT_EVENT_TRACKING_QUEUE_TABLE_NAME,
     _AWA_STACKS_QUEUE_TABLE_NAME,
   }),
   table_primary_key_attribute_names_by_table_name={
     _AWA_FLEETS_TABLE_NAME: ("id",),
     _AWA_STACKS_TABLE_NAME: ("id",),
     _AWA_ASSOCIATIONS_STUDENT_TABLE_NAME: ("id",),
-    _AWA_ASSOCIATIONS_STUDENT_QUEUE_TABLE_NAME: ("student_association_id",),
+    _AWA_ASSOCIATIONS_STUDENT_EVENT_TRACKING_QUEUE_TABLE_NAME: ("student_association_id",),
     _AWA_STACKS_QUEUE_TABLE_NAME: ("stack_id",),
   },
   gsi_key_attribute_names_by_index_name={
@@ -251,7 +251,7 @@ def test_transact_put_association_and_decrement_fleet_remaining_count(
       condition_expression="attribute_not_exists(id)",
     ),
     _build_transact_put_item(
-      _AWA_ASSOCIATIONS_STUDENT_QUEUE_TABLE_NAME,
+      _AWA_ASSOCIATIONS_STUDENT_EVENT_TRACKING_QUEUE_TABLE_NAME,
       association_queue_item,
       condition_expression="attribute_not_exists(student_association_id)",
     ),

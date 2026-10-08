@@ -226,7 +226,7 @@ Creatify does **not** import table names into `creatify_as`. Binding lives in:
 | [`awa_dynamodb_patch.py`](../../../lambda/instance_lifecycle/project/tests/integration/awa/awa_dynamodb_patch.py) | Patches `creatify_lambda.aws.dynamodb.*` to delegate to glue instance |
 | [`conftest.py`](../../../lambda/instance_lifecycle/project/tests/integration/awa/conftest.py) | Integration-only autouse patch |
 
-AWA tables wired in glue: `awa_fleets`, `awa_stacks`, `awa_associations_student`, `awa_associations_student_queue`, `awa_fleets_queue`, `awa_stacks_queue`, `awa_log_items`, plus GSIs from config.
+AWA tables wired in glue: `awa_fleets`, `awa_stacks`, `awa_associations_student`, `awa_associations_student_event_tracking_queue`, `awa_fleets_queue`, `awa_stacks_queue`, `awa_log_items`, plus GSIs from config.
 
 ---
 
