@@ -35,6 +35,17 @@ This package is vendored at [`vendor/internal/creatify_aws_simulators/`](.) and 
 
 ---
 
+## Operator CLI — `awsim_fleet_create`
+
+End-to-end **simulator** walkthrough (import image, start fleet, optional teardown on Enter). **No AWS credentials** — all calls go through `AppStreamSimulator` and `FakeAppStreamClient`.
+
+```bash
+pip install -e .
+awsim_fleet_create test-ami stream.standard.medium 2 --skip-teardown
+```
+
+Defaults: **`be_quick`** simulator timing (10s transitions), built-in `VpcConfig` (`subnet-awsim-*`, `sg-awsim-default`). Override subnets with `AWSIM_SUBNET_IDS` / `AWSIM_SECURITY_GROUP_IDS`, or set `AWSIM_LAUNCH_ENV_FILEPATH` to a local `launch.env` file. IAM role ARN is **synthetic** (`arn:aws:iam::123456789012:role/…`) unless you set `AWSIM_IAM_ROLE_ARN` or `--iam-role-arn`. Use `--slow` for production-like delays. Progress is on **stderr**; polls every 15 seconds.
+
 ## Install and run vendor tests
 
 ```bash

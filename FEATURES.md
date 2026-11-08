@@ -7,6 +7,7 @@ In-memory AWS simulators for Creatify tests. Install and pytest commands live in
 | Module | Capabilities |
 |--------|----------------|
 | **AppStream** | Fleet/stack/image lifecycle (worker threads + `be_quick`), capacity-aware streaming URLs, sessions, tagging, optional EC2 fleet backing |
+| **Operator CLI** | `awsim_fleet_create` — in-memory AppStream import/fleet demo (no live AWS); built-in VPC defaults, optional `launch.env` or env overrides |
 | **DynamoDB** | Regional table partitions; in-memory query/scan subset, transact writes; `FakeDynamoDbClient` |
 | **EC2** | Per-thread instance lifecycle: `RunInstances`, start/stop/terminate, describe, `create_tags`; linux/windows timings and `be_quick` mode |
 
