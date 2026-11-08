@@ -15,7 +15,7 @@ def resolve_choice_next_state(
   choices_list = state_definition.get("Choices", [])
 
   for choice_rule in choices_list:
-    if _choice_rule_matches(choice_rule, input_document, intrinsic_context):
+    if _choice_branch_matches(choice_rule, input_document, intrinsic_context):
       return str(choice_rule["Next"])
 
   if "Default" not in state_definition:
@@ -24,15 +24,37 @@ def resolve_choice_next_state(
   return str(state_definition["Default"])
 
 
-def _choice_rule_matches(
+def _choice_branch_matches(
   choice_rule: dict[str, typing.Any],
   input_document: typing.Any,
   intrinsic_context: dict[str, typing.Any],
 ) -> bool:
-  """Return whether one Choice rule matches the input document."""
+  """Return whether one Choice branch matches the input document."""
 
-  if "BooleanEquals" in choice_rule:
-    variable_path = choice_rule["Variable"]
+  if "And" in choice_rule:
+    composite_rules = choice_rule["And"]
+
+    return all(
+      _choice_predicate_matches(
+        composite_rule,
+        input_document,
+        intrinsic_context,
+      )
+      for composite_rule in composite_rules
+    )
+
+  return _choice_predicate_matches(choice_rule, input_document, intrinsic_context)
+
+
+def _choice_predicate_matches(
+  choice_predicate: dict[str, typing.Any],
+  input_document: typing.Any,
+  intrinsic_context: dict[str, typing.Any],
+) -> bool:
+  """Return whether one Choice predicate matches the input document."""
+
+  if "BooleanEquals" in choice_predicate:
+    variable_path = choice_predicate["Variable"]
 
     field_value = creatify_as.sfn.asl_path_utility.resolve_json_path(
       variable_path,
@@ -40,10 +62,10 @@ def _choice_rule_matches(
       intrinsic_context,
     )
 
-    return field_value == choice_rule["BooleanEquals"]
+    return field_value == choice_predicate["BooleanEquals"]
 
-  if "StringEquals" in choice_rule:
-    variable_path = choice_rule["Variable"]
+  if "StringEquals" in choice_predicate:
+    variable_path = choice_predicate["Variable"]
 
     field_value = creatify_as.sfn.asl_path_utility.resolve_json_path(
       variable_path,
@@ -51,11 +73,11 @@ def _choice_rule_matches(
       intrinsic_context,
     )
 
-    return str(field_value) == str(choice_rule["StringEquals"])
+    return str(field_value) == str(choice_predicate["StringEquals"])
 
-  if "IsPresent" in choice_rule:
-    variable_path = choice_rule["Variable"]
-    is_present_required = bool(choice_rule["IsPresent"])
+  if "IsPresent" in choice_predicate:
+    variable_path = choice_predicate["Variable"]
+    is_present_required = bool(choice_predicate["IsPresent"])
 
     try:
       creatify_as.sfn.asl_path_utility.resolve_json_path(
@@ -70,6 +92,6 @@ def _choice_rule_matches(
 
   raise ValueError(
     "unsupported Choice rule keys={keys}".format(
-      keys=sorted(choice_rule.keys()),
+      keys=sorted(choice_predicate.keys()),
     ),
   )
