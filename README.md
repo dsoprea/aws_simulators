@@ -21,6 +21,8 @@ This package is vendored at [`vendor/internal/creatify_aws_simulators/`](.) and 
 
 **AppStream:** `AppStreamSimulator` models fleet/stack lifecycle, associations, sessions, and streaming URLs for AWA utilities. It is **not** a complete AppStream 2.0 service.
 
+**EC2:** `Ec2Simulator` models instance start, stop, terminate, describe, tags, and `RunInstances` with per-instance worker threads and linux/windows transition timing. It is **not** a complete EC2 API.
+
 ---
 
 ## Design rules
@@ -59,10 +61,14 @@ src/creatify_as/
   appstream/
     simulator.py      # AppStreamSimulator, AppStreamSimulatorConfig
     fake_client.py    # FakeAppStreamClient (boto-shaped)
+  ec2/
+    simulator.py      # Ec2Simulator, Ec2SimulatorConfig
+    fake_client.py    # FakeEc2Client (boto-shaped)
   dynamodb/
     simulator.py      # DynamoDbSimulator, DynamoDbSimulatorConfig
 tests/
   appstream/test_simulator.py
+  ec2/test_ec2_simulator.py
   dynamodb/test_dynamodb_simulator.py
 ```
 
@@ -148,6 +154,76 @@ Methods delegate to `AppStreamSimulator` with boto parameter names (`FleetName`,
 Production code uses `AwaAppStreamInterface`. Integration tests use [`MockAwaAppStream`](../../../lambda/instance_lifecycle/project/tests/integration/awa/awa_appstream_mock.py) — subclasses `BotoAwaAppStream` and returns `FakeAppStreamClient` per region from one shared simulator.
 
 **Legacy unit tests:** [`tests/aws/appstream/`](../../../lambda/instance_lifecycle/project/tests/aws/appstream/) still use inline `_FakeAppStreamClient` classes. Migrate them to `FakeAppStreamClient` + shared fixture (see follow-up plan Phase A).
+
+---
+
+## EC2 module
+
+### Quick start
+
+```python
+import creatify_as.ec2.fake_client
+import creatify_as.ec2.simulator
+
+simulator = creatify_as.ec2.simulator.Ec2Simulator(
+  config=creatify_as.ec2.simulator.Ec2SimulatorConfig(be_quick=True),
+  sleep_fn=lambda seconds: None,  # inject no-op or virtual clock in unit tests
+)
+
+client = creatify_as.ec2.fake_client.FakeEc2Client(simulator)
+
+run_response = client.run_instances(
+  ImageId="ami-12345678",
+  InstanceType="g4dn.xlarge",
+  MinCount=1,
+  MaxCount=1,
+  PlatformType="windows",
+)
+
+instance_id = run_response["Instances"][0]["InstanceId"]
+simulator.wait_for_instance_state(instance_id, "running", timeout_seconds=5.0)
+```
+
+### `Ec2SimulatorConfig`
+
+| Field | Default | Role |
+|-------|---------|------|
+| `region_name` | `us-east-1` | `FakeEc2Client.meta.region_name` |
+| `account_id` | `123456789012` | Reserved for future ARN fields |
+| `be_quick` | `False` | When `True`, use 10s for start, stop, and terminate delays (use in unit tests) |
+
+### Transition timing (`be_quick=False`)
+
+| Segment | Linux | Windows |
+|---------|-------|---------|
+| Start (`pending` → `running`) | 60s | 240s |
+| Stop (`stopping` → `stopped`) | 60s | 60s |
+| Terminate (`shutting-down` → `terminated`) | 60s | 180s |
+
+Each instance uses **one daemon worker thread**. API calls set intermediate states synchronously (`pending`, `stopping`, `shutting-down`); the worker sleeps, then sets the target state. Terminating from `running` enters `shutting-down` immediately (no stop phase).
+
+### Platform type
+
+Set `PlatformType="linux"` or `"windows"` on `run_instances`, tag `creatify_as_platform_type` on instance tags, or pass `platform_type=` to `seed_instance`. Default is `linux`.
+
+### `FakeEc2Client` coverage
+
+| Method | Notes |
+|--------|--------|
+| `run_instances` | Single instance (`MinCount=MaxCount=1` only) |
+| `start_instances` / `stop_instances` / `terminate_instances` | Idempotent when already in target progression |
+| `describe_instances` | `InstanceIds` and filters: `instance-id`, `instance-state-name`, `tag:Key` |
+| `create_tags` | Upsert tags on instance resources |
+
+### Test helpers on simulator
+
+| Method | Purpose |
+|--------|---------|
+| `reset()` | Join workers and clear instances |
+| `seed_instance(...)` | Insert instance without `RunInstances` |
+| `wait_for_instance_state(...)` | Poll until a state is reached |
+
+Vendor unit tests always use `be_quick=True` plus a no-op or recording `sleep_fn` — never multi-minute wall-clock sleeps in CI.
 
 ---
 
@@ -291,6 +367,13 @@ cd lambda/instance_lifecycle/project
 ---
 
 ## Limitations (intentional)
+
+**EC2**
+
+- Single-instance `RunInstances` only (`MinCount=MaxCount=1`).
+- No EC2 API beyond describe/start/stop/terminate/tags/run.
+- Describe filter subset only; unknown filters raise `ValueError`.
+- No IAM, ENI, or subnet modeling.
 
 **AppStream**
 
