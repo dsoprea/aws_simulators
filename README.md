@@ -23,6 +23,8 @@ This package is vendored at [`vendor/internal/creatify_aws_simulators/`](.) and 
 
 **EC2:** `Ec2Simulator` models instance start, stop, terminate, describe, tags, and `RunInstances` with per-instance worker threads and linux/windows transition timing. It is **not** a complete EC2 API.
 
+**Step Functions:** `StateMachineSimulator` runs a **subset** of Amazon States Language for Creatify workflows: `lambda:invoke` Tasks with a handler map, Choice, Wait, Pass, inline Map (`ThreadPoolExecutor` sized by `MaxConcurrency`), Retry, and Catch. It is **not** a complete Step Functions service.
+
 ---
 
 ## Design rules
@@ -75,6 +77,9 @@ src/creatify_as/
   ec2/
     simulator.py      # Ec2Simulator, Ec2SimulatorConfig
     fake_client.py    # FakeEc2Client (boto-shaped)
+  sfn/
+    simulator.py      # StateMachineSimulator, StateMachineSimulatorConfig
+    fake_client.py    # FakeSfnClient (boto-shaped)
   dynamodb/
     simulator.py      # DynamoDbSimulator, DynamoDbSimulatorConfig
     fake_client.py    # FakeDynamoDbClient (regional)
@@ -82,6 +87,7 @@ tests/
   appstream/test_simulator.py
   ec2/test_ec2_simulator.py
   dynamodb/test_dynamodb_simulator.py
+  sfn/test_sfn_simulator.py
 ```
 
 **DynamoDB:** `FakeDynamoDbClient` binds one `region_name` (default `us-east-1`) to every get/put/query/scan/transact call. Creatify integration tests patch `creatify_lambda.aws.dynamodb` helpers to delegate to `DynamoDbSimulator` with region from `AWS_REGION` (glue adapter pattern below).
@@ -239,6 +245,93 @@ Set `PlatformType="linux"` or `"windows"` on `run_instances`, tag `creatify_as_p
 | `wait_for_instance_state(...)` | Poll until a state is reached |
 
 Vendor unit tests always use `be_quick=True` plus a no-op or recording `sleep_fn` — never multi-minute wall-clock sleeps in CI.
+
+---
+
+## Step Functions module
+
+### Quick start
+
+```python
+import creatify_as.sfn.fake_client
+import creatify_as.sfn.simulator
+
+def setup_handler(payload: dict) -> dict:
+  return {"execution_document": {"count": 1}}
+
+simulator = creatify_as.sfn.simulator.StateMachineSimulator(
+  sleep_fn=lambda seconds: None,
+  task_handler_by_function_key={"step_demo__1_setup": setup_handler},
+)
+
+definition = {
+  "StartAt": "Setup",
+  "States": {
+    "Setup": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "step_demo__1_setup",
+        "Payload": {"execution_document.$": "$"},
+      },
+      "ResultSelector": {"execution_document.$": "$.Payload.execution_document"},
+      "OutputPath": "$.execution_document",
+      "End": True,
+    },
+  },
+}
+
+state_machine_arn = simulator.register_state_machine("demo", definition)
+start_response = simulator.start_execution(
+  state_machine_arn_or_name=state_machine_arn,
+  execution_name="unit-test",
+  execution_input={},
+)
+simulator.wait_for_execution(start_response["executionArn"], timeout_seconds=5.0)
+```
+
+Register **`task_handler_by_function_key`** on the simulator (or pass per `start_execution`). Keys match `FunctionName` or the final segment of a Lambda ARN. Handlers receive the resolved **Payload** object and return a JSON object that becomes the invoke **Payload**.
+
+### Threading
+
+| Layer | Behavior |
+|-------|----------|
+| **Manager** | One daemon thread per execution walks top-level states |
+| **Top-level state** | Each state runs on a short-lived worker thread |
+| **Map** | `ThreadPoolExecutor(max_workers=MaxConcurrency)`; default **1** worker when `MaxConcurrency` is omitted |
+| **Map item** | INLINE `ItemProcessor` runs synchronously on a pool worker (nested Tasks do not spawn extra top-level workers) |
+
+Pass injectable **`sleep_fn`** and **`time_fn`** so `Wait` and Task **Retry** delays do not sleep in CI.
+
+### `StateMachineSimulatorConfig`
+
+| Field | Default | Role |
+|-------|---------|------|
+| `region_name` | `us-east-1` | Synthetic ARN region |
+| `account_id` | `123456789012` | Synthetic ARN account |
+| `step_delay_seconds` | **`5.0`** | Sleep before each **Task** handler invoke (every retry attempt); set **`0.0`** in unit tests |
+
+### Supported ASL (v1)
+
+| Type | Notes |
+|------|--------|
+| Task | `arn:aws:states:::lambda:invoke` only |
+| Choice | `BooleanEquals`, `StringEquals`, `IsPresent` |
+| Wait | `Seconds` |
+| Pass | `Parameters` / `Result` |
+| Map | INLINE `ItemProcessor`, `MaxConcurrency`, `ItemSelector`, `ResultPath` |
+| Fail / Succeed | Terminal |
+
+Unsupported constructs raise **`ValueError`** (unknown state type, resource, Map mode). Missing JSONPath raises **`States.Runtime`** / `JSONPath not found`. Handler failures become **`States.TaskFailed`** unless **Catch** / **Retry** apply.
+
+### `FakeSfnClient`
+
+| Method | Notes |
+|--------|--------|
+| `start_execution` | `input` is a JSON string; starts async execution |
+| `describe_execution` | `RUNNING` / `SUCCEEDED` / `FAILED` plus `input` / `output` JSON strings |
+
+Handlers must be configured on the backing **`StateMachineSimulator`** (the fake client does not accept a handler map on each call).
 
 ---
 
