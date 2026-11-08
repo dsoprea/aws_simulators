@@ -37,6 +37,9 @@ class FakeAppStreamClient:
     self.tag_resource_calls: list[dict[str, typing.Any]] = []
     self.untag_resource_calls: list[dict[str, typing.Any]] = []
     self.update_fleet_calls: list[dict[str, typing.Any]] = []
+    self.create_imported_image_calls: list[dict[str, typing.Any]] = []
+    self.delete_image_calls: list[dict[str, typing.Any]] = []
+    self.update_stack_calls: list[dict[str, typing.Any]] = []
 
   def associate_fleet(self, **keyword_arguments: typing.Any) -> None:
     self.associate_fleet_calls.append(keyword_arguments)
@@ -176,3 +179,23 @@ class FakeAppStreamClient:
     self.update_fleet_calls.append(keyword_arguments)
 
     return self._simulator.update_fleet(region_name=self._region_name, **keyword_arguments)
+
+  def create_imported_image(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+    self.create_imported_image_calls.append(keyword_arguments)
+
+    return self._simulator.create_imported_image(
+      region_name=self._region_name,
+      **keyword_arguments,
+    )
+
+  def delete_image(self, **keyword_arguments: typing.Any) -> None:
+    self.delete_image_calls.append(keyword_arguments)
+    self._simulator.delete_image(
+      region_name=self._region_name,
+      name=keyword_arguments["Name"],
+    )
+
+  def update_stack(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+    self.update_stack_calls.append(keyword_arguments)
+
+    return self._simulator.update_stack(region_name=self._region_name, **keyword_arguments)

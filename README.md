@@ -86,11 +86,8 @@ import creatify_as.appstream.fake_client
 import creatify_as.appstream.simulator
 
 simulator = creatify_as.appstream.simulator.AppStreamSimulator(
-  config=creatify_as.appstream.simulator.AppStreamSimulatorConfig(
-    fleet_state_transition_delay_seconds=0.05,
-    stack_state_transition_delay_seconds=0.01,
-  ),
-  time_fn=lambda: 0.0,  # virtual clock — no real sleeps
+  config=creatify_as.appstream.simulator.AppStreamSimulatorConfig(be_quick=True),
+  sleep_fn=lambda seconds: None,  # instant worker delays in unit tests
 )
 
 client = creatify_as.appstream.fake_client.FakeAppStreamClient(simulator)
@@ -106,16 +103,21 @@ client.associate_fleet(FleetName="staging.my-fleet", StackName="staging.my-stack
 |-------|---------|------|
 | `region_name` | `us-east-1` | ARN construction and `FakeAppStreamClient.meta.region_name` |
 | `account_id` | `123456789012` | ARN construction |
-| `fleet_state_transition_delay_seconds` | `0.05` | `create_fleet` / `start_fleet` → `RUNNING` |
-| `stack_state_transition_delay_seconds` | `0.01` | `create_stack` → `AVAILABLE` |
+| `be_quick` | `False` | When `True`, use **10s** worker delays instead of production-like delays |
+| `fleet_start_delay_seconds` | `300` | `start_fleet` → `RUNNING` when not `be_quick` |
+| `fleet_stop_delay_seconds` | `60` | `stop_fleet` → `STOPPED` when not `be_quick` |
+| `stack_available_delay_seconds` | `120` | `create_stack` → `AVAILABLE` when not `be_quick` |
+| `image_import_delay_seconds` | `300` | `create_imported_image` → `AVAILABLE` when not `be_quick` |
+| `streaming_url_template` | AWS-shaped default | Placeholders: `{region}`, `{session_id}`, `{user_id}`, `{stack_name}`, `{fleet_name}`, `{application_id}` |
 | `streaming_url_validity_seconds` | `3600` | Default validity hint |
+| `fleet_state_transition_delay_seconds` | `None` | Deprecated override for both fleet start and stop delays |
+| `stack_state_transition_delay_seconds` | `None` | Deprecated override for stack available delay |
 
-### Virtual clock
+### Worker threads and `sleep_fn`
 
-When `time_fn` is provided (or `sleep_fn` is overridden), the simulator uses a **virtual clock**:
+Fleets, stacks, and image imports transition on **daemon worker threads** that call `sleep_fn(delay)` — mirror [`Ec2Simulator`](#ec2-module). Unit tests use `be_quick=True` and a no-op `sleep_fn`; use `wait_for_fleet_state`, `wait_for_stack_state`, or `wait_for_image_state` when a transition is asynchronous.
 
-- `advance_time(seconds)` — jump time and apply scheduled fleet/stack transitions.
-- Poll helpers in consumer code should use the same simulator instance and advance time in tests instead of sleeping.
+`advance_time(seconds)` only advances the optional virtual clock used for `Expires` on streaming URLs when `time_fn` is wired; it does not drive resource state transitions.
 
 ### Key semantics (test-critical)
 
@@ -139,7 +141,8 @@ Methods delegate to `AppStreamSimulator` with boto parameter names (`FleetName`,
 | `describe_sessions` / `expire_session` | Session tracking |
 | `tag_resource` / `untag_resource` / `list_tags_for_resource` | Tags by ARN |
 | `describe_images` | Uses `seed_image` data |
-| `update_fleet` | Subset of fields used by AWA |
+| `create_imported_image` / `delete_image` | Image import lifecycle |
+| `update_fleet` / `update_stack` | Capacity, `StreamView`, `EmbedHostDomains`, etc. |
 
 ### Test helpers on simulator
 

@@ -1,10 +1,24 @@
 """In-memory AppStream state machine for tests without live AWS calls."""
 
 import dataclasses
+import datetime
+import threading
 import time
 import typing
 
 from botocore.exceptions import ClientError
+
+APPSTREAM_QUICK_DELAY_SECONDS = 10.0
+
+DEFAULT_STREAMING_URL_TEMPLATE = (
+  "https://appstream.{region}.amazonaws.com/authenticate?"
+  "parameters=sim-{session_id}-{user_id}"
+)
+
+STREAM_INSTANCE_TYPE_TO_EC2_INSTANCE_TYPE = {
+  "stream.standard.medium": "g4dn.xlarge",
+  "stream.standard.large": "g4dn.2xlarge",
+}
 
 
 @dataclasses.dataclass
@@ -13,20 +27,52 @@ class AppStreamSimulatorConfig:
 
   region_name: str = "us-east-1"
   account_id: str = "123456789012"
-  fleet_state_transition_delay_seconds: float = 0.05
-  stack_state_transition_delay_seconds: float = 0.01
+  be_quick: bool = False
+  fleet_start_delay_seconds: float = 300.0
+  fleet_stop_delay_seconds: float = 60.0
+  stack_available_delay_seconds: float = 120.0
+  image_import_delay_seconds: float = 300.0
   streaming_url_validity_seconds: int = 3600
+  streaming_url_template: str = DEFAULT_STREAMING_URL_TEMPLATE
   describe_list_page_size: int | None = None
+  fleet_state_transition_delay_seconds: float | None = None
+  stack_state_transition_delay_seconds: float | None = None
 
+  def resolve_quick_delay_seconds(self) -> float:
+    return APPSTREAM_QUICK_DELAY_SECONDS
 
-@dataclasses.dataclass
-class _ScheduledTransition:
-  """One fleet or stack state change scheduled on the virtual clock."""
+  def resolve_fleet_start_delay_seconds(self) -> float:
+    if self.fleet_state_transition_delay_seconds is not None:
+      return self.fleet_state_transition_delay_seconds
 
-  fire_at: float
-  resource_kind: str
-  resource_name: str
-  target_state: str
+    if self.be_quick:
+      return self.resolve_quick_delay_seconds()
+
+    return self.fleet_start_delay_seconds
+
+  def resolve_fleet_stop_delay_seconds(self) -> float:
+    if self.fleet_state_transition_delay_seconds is not None:
+      return self.fleet_state_transition_delay_seconds
+
+    if self.be_quick:
+      return self.resolve_quick_delay_seconds()
+
+    return self.fleet_stop_delay_seconds
+
+  def resolve_stack_available_delay_seconds(self) -> float:
+    if self.stack_state_transition_delay_seconds is not None:
+      return self.stack_state_transition_delay_seconds
+
+    if self.be_quick:
+      return self.resolve_quick_delay_seconds()
+
+    return self.stack_available_delay_seconds
+
+  def resolve_image_import_delay_seconds(self) -> float:
+    if self.be_quick:
+      return self.resolve_quick_delay_seconds()
+
+    return self.image_import_delay_seconds
 
 
 @dataclasses.dataclass
@@ -40,7 +86,11 @@ class _FleetRecord:
   desired_instances: int
   image_name: str
   instance_type: str
+  lock: threading.Lock
+  fleet_type: str = "ON_DEMAND"
+  stream_view: str = "APP"
   max_user_duration_seconds: int | None = None
+  backing_ec2_instance_ids: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -51,6 +101,8 @@ class _StackRecord:
   arn: str
   display_name: str
   state: str
+  lock: threading.Lock
+  embed_host_domains: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -74,8 +126,8 @@ class _RegionalState:
   stack_to_fleet_names: dict[str, set[str]] = dataclasses.field(default_factory=dict)
   tags_by_arn: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
   sessions: list[_SessionRecord] = dataclasses.field(default_factory=list)
-  scheduled_transitions: list[_ScheduledTransition] = dataclasses.field(default_factory=list)
   streaming_url_counter: int = 0
+  image_lock_by_name: dict[str, threading.Lock] = dataclasses.field(default_factory=dict)
   image_objects_by_name: dict[str, dict[str, typing.Any]] = dataclasses.field(default_factory=dict)
   image_objects_by_arn: dict[str, dict[str, typing.Any]] = dataclasses.field(default_factory=dict)
 
@@ -89,11 +141,13 @@ class AppStreamSimulator:
     config: AppStreamSimulatorConfig | None = None,
     time_fn: typing.Callable[[], float] | None = None,
     sleep_fn: typing.Callable[[float], None] | None = None,
+    ec2_simulator: typing.Any | None = None,
   ) -> None:
     self._config = config or AppStreamSimulatorConfig()
     self._time_fn = time_fn or time.monotonic
     self._virtual_clock_seconds = 0.0
     self._use_virtual_clock = time_fn is not None or sleep_fn is not None
+    self._ec2_simulator = ec2_simulator
 
     if sleep_fn is not None:
       self._sleep_fn = sleep_fn
@@ -129,10 +183,9 @@ class AppStreamSimulator:
     return self._regional_state_by_region_name[resolved_region_name]
 
   def advance_time(self, seconds: float) -> None:
-    """Advance the virtual clock and apply due state transitions."""
+    """Advance the virtual clock (async worker delays use ``sleep_fn``)."""
 
     self._virtual_clock_seconds = self._virtual_clock_seconds + seconds
-    self._apply_due_transitions()
 
   def _now(self) -> float:
     if self._use_virtual_clock:
@@ -143,55 +196,293 @@ class AppStreamSimulator:
   def _advance_virtual_clock(self, seconds: float) -> None:
     self.advance_time(seconds)
 
-  def _apply_due_transitions(self, region_name: str | None = None) -> None:
-    if region_name is not None:
-      self._apply_due_transitions_for_state(self._regional_state(region_name))
+  def _count_active_sessions_for_fleet(
+    self,
+    regional_state: _RegionalState,
+    fleet_name: str,
+  ) -> int:
+    active_session_count = 0
+
+    for session_record in regional_state.sessions:
+      if session_record.fleet_name != fleet_name:
+        continue
+
+      if session_record.state != "ACTIVE":
+        continue
+
+      active_session_count = active_session_count + 1
+
+    return active_session_count
+
+  def _resolve_ec2_instance_type(self, stream_instance_type: str) -> str:
+    mapped_instance_type = STREAM_INSTANCE_TYPE_TO_EC2_INSTANCE_TYPE.get(stream_instance_type)
+
+    if mapped_instance_type is not None:
+      return mapped_instance_type
+
+    if stream_instance_type.startswith("stream."):
+      return "g4dn.xlarge"
+
+    return stream_instance_type
+
+  def _provision_ec2_backing_for_fleet(
+    self,
+    *,
+    fleet_record: _FleetRecord,
+    region_name: str,
+  ) -> None:
+    if self._ec2_simulator is None:
+      return
+
+    image_object = self._regional_state(region_name).image_objects_by_name.get(fleet_record.image_name)
+    source_ami_id = "ami-00000000"
+
+    if image_object is not None and "SourceAmiId" in image_object:
+      source_ami_id = image_object["SourceAmiId"]
+
+    ec2_instance_type = self._resolve_ec2_instance_type(fleet_record.instance_type)
+    new_instance_ids: list[str] = []
+
+    for _instance_index in range(fleet_record.desired_instances):
+      run_instances_response = self._ec2_simulator.run_instances(
+        region_name=region_name,
+        ImageId=source_ami_id,
+        InstanceType=ec2_instance_type,
+        PlatformType="windows",
+        MinCount=1,
+        MaxCount=1,
+      )
+      new_instance_ids.append(run_instances_response["Instances"][0]["InstanceId"])
+
+    fleet_record.backing_ec2_instance_ids = new_instance_ids
+
+  def _tear_down_ec2_backing_for_fleet(
+    self,
+    *,
+    fleet_record: _FleetRecord,
+    region_name: str,
+  ) -> None:
+    if self._ec2_simulator is None:
+      fleet_record.backing_ec2_instance_ids = []
 
       return
 
-    for regional_state in self._regional_state_by_region_name.values():
-      self._apply_due_transitions_for_state(regional_state)
+    for instance_id in fleet_record.backing_ec2_instance_ids:
+      self._ec2_simulator.terminate_instances(
+        instance_ids=[instance_id],
+        region_name=region_name,
+      )
 
-  def _apply_due_transitions_for_state(self, regional_state: _RegionalState) -> None:
-    current_time = self._now()
-    remaining_transitions: list[_ScheduledTransition] = []
+    fleet_record.backing_ec2_instance_ids = []
 
-    for scheduled_transition in sorted(
-      regional_state.scheduled_transitions,
-      key=lambda row: row.fire_at):
-      if scheduled_transition.fire_at > current_time:
-        remaining_transitions.append(scheduled_transition)
-        continue
-
-      if scheduled_transition.resource_kind == "fleet":
-        fleet_record = regional_state.fleets.get(scheduled_transition.resource_name)
-
-        if fleet_record is not None:
-          fleet_record.state = scheduled_transition.target_state
-
-      if scheduled_transition.resource_kind == "stack":
-        stack_record = regional_state.stacks.get(scheduled_transition.resource_name)
-
-        if stack_record is not None:
-          stack_record.state = scheduled_transition.target_state
-
-    regional_state.scheduled_transitions = remaining_transitions
-
-  def _schedule_transition(
+  def _run_fleet_transition_worker(
     self,
     *,
-    regional_state: _RegionalState,
-    resource_kind: str,
-    resource_name: str,
+    region_name: str,
+    fleet_name: str,
+    expected_intermediate_state: str,
     target_state: str,
     delay_seconds: float,
   ) -> None:
-    regional_state.scheduled_transitions.append(
-      _ScheduledTransition(
-        fire_at=self._now() + delay_seconds,
-        resource_kind=resource_kind,
-        resource_name=resource_name,
-        target_state=target_state,
+    self._sleep_fn(delay_seconds)
+    regional_state = self._regional_state(region_name)
+    fleet_record = regional_state.fleets.get(fleet_name)
+
+    if fleet_record is None:
+      return
+
+    with fleet_record.lock:
+      if fleet_record.state != expected_intermediate_state:
+        return
+
+      fleet_record.state = target_state
+
+      if target_state == "RUNNING":
+        self._provision_ec2_backing_for_fleet(
+          fleet_record=fleet_record,
+          region_name=region_name,
+        )
+
+      if target_state == "STOPPED":
+        self._tear_down_ec2_backing_for_fleet(
+          fleet_record=fleet_record,
+          region_name=region_name,
+        )
+
+  def _begin_fleet_state_transition(
+    self,
+    *,
+    region_name: str,
+    fleet_name: str,
+    intermediate_state: str,
+    target_state: str,
+    delay_seconds: float,
+  ) -> None:
+    worker_thread = threading.Thread(
+      target=self._run_fleet_transition_worker,
+      kwargs={
+        "region_name": region_name,
+        "fleet_name": fleet_name,
+        "expected_intermediate_state": intermediate_state,
+        "target_state": target_state,
+        "delay_seconds": delay_seconds,
+      },
+      daemon=True,
+    )
+    worker_thread.start()
+
+  def _run_stack_available_worker(
+    self,
+    *,
+    region_name: str,
+    stack_name: str,
+    delay_seconds: float,
+  ) -> None:
+    self._sleep_fn(delay_seconds)
+    regional_state = self._regional_state(region_name)
+    stack_record = regional_state.stacks.get(stack_name)
+
+    if stack_record is None:
+      return
+
+    with stack_record.lock:
+      if stack_record.state != "PENDING":
+        return
+
+      stack_record.state = "AVAILABLE"
+
+  def _begin_stack_available_transition(
+    self,
+    *,
+    region_name: str,
+    stack_name: str,
+    delay_seconds: float,
+  ) -> None:
+    worker_thread = threading.Thread(
+      target=self._run_stack_available_worker,
+      kwargs={
+        "region_name": region_name,
+        "stack_name": stack_name,
+        "delay_seconds": delay_seconds,
+      },
+      daemon=True,
+    )
+    worker_thread.start()
+
+  def _run_image_import_worker(
+    self,
+    *,
+    region_name: str,
+    image_name: str,
+    delay_seconds: float,
+  ) -> None:
+    self._sleep_fn(delay_seconds)
+    regional_state = self._regional_state(region_name)
+    image_lock = regional_state.image_lock_by_name.get(image_name)
+
+    if image_lock is None:
+      return
+
+    with image_lock:
+      image_object = regional_state.image_objects_by_name.get(image_name)
+
+      if image_object is None:
+        return
+
+      if image_object["State"] != "IMPORTING":
+        return
+
+      image_object["State"] = "AVAILABLE"
+      image_arn = image_object["Arn"]
+      mirrored_image = regional_state.image_objects_by_arn.get(image_arn)
+
+      if mirrored_image is not None:
+        mirrored_image["State"] = "AVAILABLE"
+
+  def wait_for_fleet_state(
+    self,
+    *,
+    region_name: str | None = None,
+    fleet_name: str,
+    state: str,
+    timeout_seconds: float = 30.0,
+    poll_sleep_seconds: float = 0.05,
+  ) -> None:
+    """Poll ``describe_fleets`` until *fleet_name* reaches *state* or time out."""
+
+    deadline = self._now() + timeout_seconds
+
+    while self._now() < deadline:
+      fleet_objects = self.describe_fleets(region_name=region_name, names=[fleet_name])["Fleets"]
+
+      if len(fleet_objects) > 0 and fleet_objects[0]["State"] == state:
+        return
+
+      self._sleep_fn(poll_sleep_seconds)
+
+    raise TimeoutError(
+      "fleet {fleet_name} did not reach state={state} within {timeout_seconds}s".format(
+        fleet_name=fleet_name,
+        state=state,
+        timeout_seconds=timeout_seconds,
+      ),
+    )
+
+  def wait_for_stack_state(
+    self,
+    *,
+    region_name: str | None = None,
+    stack_name: str,
+    state: str = "AVAILABLE",
+    timeout_seconds: float = 30.0,
+    poll_sleep_seconds: float = 0.05,
+  ) -> None:
+    """Poll ``describe_stacks`` until *stack_name* reaches *state* or time out."""
+
+    deadline = self._now() + timeout_seconds
+
+    while self._now() < deadline:
+      stack_objects = self.describe_stacks(region_name=region_name, names=[stack_name])["Stacks"]
+
+      if len(stack_objects) > 0 and stack_objects[0]["State"] == state:
+        return
+
+      self._sleep_fn(poll_sleep_seconds)
+
+    raise TimeoutError(
+      "stack {stack_name} did not reach state={state} within {timeout_seconds}s".format(
+        stack_name=stack_name,
+        state=state,
+        timeout_seconds=timeout_seconds,
+      ),
+    )
+
+  def wait_for_image_state(
+    self,
+    *,
+    region_name: str | None = None,
+    image_name: str,
+    state: str = "AVAILABLE",
+    timeout_seconds: float = 30.0,
+    poll_sleep_seconds: float = 0.05,
+  ) -> None:
+    """Poll ``describe_images`` until *image_name* reaches *state* or time out."""
+
+    deadline = self._now() + timeout_seconds
+
+    while self._now() < deadline:
+      image_objects = self.describe_images(region_name=region_name, names=[image_name])["Images"]
+
+      if len(image_objects) > 0 and image_objects[0]["State"] == state:
+        return
+
+      self._sleep_fn(poll_sleep_seconds)
+
+    raise TimeoutError(
+      "image {image_name} did not reach state={state} within {timeout_seconds}s".format(
+        image_name=image_name,
+        state=state,
+        timeout_seconds=timeout_seconds,
       ),
     )
 
@@ -248,7 +539,19 @@ class AppStreamSimulator:
 
     return response
 
-  def _fleet_object(self, fleet_record: _FleetRecord) -> dict[str, typing.Any]:
+  def _fleet_object(
+    self,
+    fleet_record: _FleetRecord,
+    *,
+    regional_state: _RegionalState,
+  ) -> dict[str, typing.Any]:
+    in_use_instances = self._count_active_sessions_for_fleet(regional_state, fleet_record.name)
+    running_instances = fleet_record.desired_instances if fleet_record.state == "RUNNING" else 0
+    available_instances = 0
+
+    if fleet_record.state == "RUNNING":
+      available_instances = max(0, running_instances - in_use_instances)
+
     fleet_object = {
       "Name": fleet_record.name,
       "Arn": fleet_record.arn,
@@ -256,14 +559,17 @@ class AppStreamSimulator:
       "State": fleet_record.state,
       "ImageName": fleet_record.image_name,
       "InstanceType": fleet_record.instance_type,
+      "FleetType": fleet_record.fleet_type,
+      "StreamView": fleet_record.stream_view,
       "ComputeCapacity": {
         "DesiredInstances": fleet_record.desired_instances,
-        "Available": fleet_record.desired_instances if fleet_record.state == "RUNNING" else 0,
+        "Available": available_instances,
       },
       "ComputeCapacityStatus": {
         "Desired": fleet_record.desired_instances,
-        "Available": fleet_record.desired_instances if fleet_record.state == "RUNNING" else 0,
-        "Running": fleet_record.desired_instances if fleet_record.state == "RUNNING" else 0,
+        "Available": available_instances,
+        "Running": running_instances,
+        "InUse": in_use_instances,
       },
     }
 
@@ -273,12 +579,17 @@ class AppStreamSimulator:
     return fleet_object
 
   def _stack_object(self, stack_record: _StackRecord) -> dict[str, typing.Any]:
-    return {
+    stack_object = {
       "Name": stack_record.name,
       "Arn": stack_record.arn,
       "DisplayName": stack_record.display_name,
       "State": stack_record.state,
     }
+
+    if len(stack_record.embed_host_domains) > 0:
+      stack_object["EmbedHostDomains"] = list(stack_record.embed_host_domains)
+
+    return stack_object
 
   def _raise_client_error(self, *, operation_name: str, error_code: str, message: str) -> None:
     raise ClientError(
@@ -327,7 +638,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     self._require_fleet(fleet_name, regional_state=regional_state)
     self._require_stack(stack_name, regional_state=regional_state)
 
@@ -365,7 +675,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     existing_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
 
     if existing_stack_name != stack_name:
@@ -392,7 +701,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     self._require_fleet(fleet_name, regional_state=regional_state)
 
     if next_token is not None:
@@ -418,7 +726,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     self._require_stack(stack_name, regional_state=regional_state)
 
     if next_token is not None:
@@ -444,9 +751,29 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     self._require_fleet(fleet_name, regional_state=regional_state)
     self._require_stack(stack_name, regional_state=regional_state)
+
+    fleet_record = regional_state.fleets[fleet_name]
+
+    if fleet_record.state != "RUNNING":
+      self._raise_client_error(
+        operation_name="CreateStreamingURL",
+        error_code="InvalidParameterException",
+        message="Fleet {fleet_name} is not RUNNING".format(fleet_name=fleet_name),
+      )
+
+    fleet_object = self._fleet_object(fleet_record, regional_state=regional_state)
+    available_instances = fleet_object["ComputeCapacityStatus"]["Available"]
+
+    if available_instances < 1:
+      self._raise_client_error(
+        operation_name="CreateStreamingURL",
+        error_code="ResourceNotAvailableException",
+        message="Fleet {fleet_name} has no available stream capacity".format(
+          fleet_name=fleet_name,
+        ),
+      )
 
     associated_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
 
@@ -462,13 +789,13 @@ class AppStreamSimulator:
 
     regional_state.streaming_url_counter = regional_state.streaming_url_counter + 1
     session_id = "sim-session-{counter}".format(counter=regional_state.streaming_url_counter)
-    streaming_url = (
-      "https://appstream.{region}.amazonaws.com/authenticate?"
-      "parameters=sim-{session_id}-{user_id}"
-    ).format(
+    streaming_url = self._config.streaming_url_template.format(
       region=resolved_region_name,
       session_id=session_id,
       user_id=user_id,
+      stack_name=stack_name,
+      fleet_name=fleet_name,
+      application_id=application_id,
     )
     expires_at = self._now() + validity
 
@@ -499,8 +826,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
-
     if names is not None:
       fleet_objects = []
 
@@ -508,12 +833,14 @@ class AppStreamSimulator:
         fleet_record = regional_state.fleets.get(fleet_name)
 
         if fleet_record is not None:
-          fleet_objects.append(self._fleet_object(fleet_record))
+          fleet_objects.append(
+            self._fleet_object(fleet_record, regional_state=regional_state),
+          )
 
       return {"Fleets": fleet_objects}
 
     fleet_objects = [
-      self._fleet_object(fleet_record)
+      self._fleet_object(fleet_record, regional_state=regional_state)
       for fleet_record in regional_state.fleets.values()
     ]
 
@@ -534,8 +861,6 @@ class AppStreamSimulator:
 
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
-
-    self._apply_due_transitions(resolved_region_name)
 
     if names is not None:
       stack_objects = []
@@ -570,7 +895,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     fleet_name = keyword_arguments["Name"]
     fleet_arn = self._build_fleet_arn(fleet_name, region_name=resolved_region_name)
     desired_instances = keyword_arguments.get("ComputeCapacity", {}).get("DesiredInstances", 1)
@@ -582,6 +906,9 @@ class AppStreamSimulator:
       desired_instances=desired_instances,
       image_name=keyword_arguments.get("ImageName", ""),
       instance_type=keyword_arguments.get("InstanceType", ""),
+      lock=threading.Lock(),
+      fleet_type=keyword_arguments.get("FleetType", "ON_DEMAND"),
+      stream_view=keyword_arguments.get("StreamView", "APP"),
       max_user_duration_seconds=keyword_arguments.get("MaxUserDurationInSeconds"),
     )
 
@@ -591,7 +918,7 @@ class AppStreamSimulator:
     if len(tags) > 0:
       regional_state.tags_by_arn[fleet_arn] = dict(tags)
 
-    return {"Fleet": self._fleet_object(fleet_record)}
+    return {"Fleet": self._fleet_object(fleet_record, regional_state=regional_state)}
 
   def start_fleet(self, *, region_name: str | None = None, name: str) -> None:
     """Move a STOPPED fleet to STARTING then RUNNING."""
@@ -599,19 +926,18 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     fleet_record = self._require_fleet(name, regional_state=regional_state)
 
     if fleet_record.state in {"RUNNING", "STARTING"}:
       return
 
     fleet_record.state = "STARTING"
-    self._schedule_transition(
-      regional_state=regional_state,
-      resource_kind="fleet",
-      resource_name=name,
+    self._begin_fleet_state_transition(
+      region_name=resolved_region_name,
+      fleet_name=name,
+      intermediate_state="STARTING",
       target_state="RUNNING",
-      delay_seconds=self._config.fleet_state_transition_delay_seconds,
+      delay_seconds=self._config.resolve_fleet_start_delay_seconds(),
     )
 
   def stop_fleet(self, *, region_name: str | None = None, name: str) -> None:
@@ -620,19 +946,18 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     fleet_record = self._require_fleet(name, regional_state=regional_state)
 
     if fleet_record.state in {"STOPPED", "STOPPING"}:
       return
 
     fleet_record.state = "STOPPING"
-    self._schedule_transition(
-      regional_state=regional_state,
-      resource_kind="fleet",
-      resource_name=name,
+    self._begin_fleet_state_transition(
+      region_name=resolved_region_name,
+      fleet_name=name,
+      intermediate_state="STOPPING",
       target_state="STOPPED",
-      delay_seconds=self._config.fleet_state_transition_delay_seconds,
+      delay_seconds=self._config.resolve_fleet_stop_delay_seconds(),
     )
 
   def delete_fleet(self, *, region_name: str | None = None, name: str) -> None:
@@ -641,8 +966,11 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
-    self._require_fleet(name, regional_state=regional_state)
+    fleet_record = self._require_fleet(name, regional_state=regional_state)
+    self._tear_down_ec2_backing_for_fleet(
+      fleet_record=fleet_record,
+      region_name=resolved_region_name,
+    )
     associated_stack_name = regional_state.fleet_to_stack_name.pop(name, None)
 
     if associated_stack_name is not None:
@@ -668,14 +996,16 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     stack_name = keyword_arguments["Name"]
     stack_arn = self._build_stack_arn(stack_name, region_name=resolved_region_name)
+    embed_host_domains = keyword_arguments.get("EmbedHostDomains") or []
     stack_record = _StackRecord(
       name=stack_name,
       arn=stack_arn,
       display_name=keyword_arguments.get("DisplayName", stack_name),
       state="PENDING",
+      lock=threading.Lock(),
+      embed_host_domains=list(embed_host_domains),
     )
 
     regional_state.stacks[stack_name] = stack_record
@@ -684,15 +1014,16 @@ class AppStreamSimulator:
     if len(tags) > 0:
       regional_state.tags_by_arn[stack_arn] = dict(tags)
 
-    self._schedule_transition(
-      regional_state=regional_state,
-      resource_kind="stack",
-      resource_name=stack_name,
-      target_state="AVAILABLE",
-      delay_seconds=self._config.stack_state_transition_delay_seconds,
+    stack_object_for_response = self._stack_object(stack_record)
+    stack_object_for_response["State"] = "PENDING"
+
+    self._begin_stack_available_transition(
+      region_name=resolved_region_name,
+      stack_name=stack_name,
+      delay_seconds=self._config.resolve_stack_available_delay_seconds(),
     )
 
-    return {"Stack": self._stack_object(stack_record)}
+    return {"Stack": stack_object_for_response}
 
   def delete_stack(self, *, region_name: str | None = None, name: str) -> None:
     """Delete one stack when no fleets remain associated."""
@@ -700,8 +1031,15 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
-    self._require_stack(name, regional_state=regional_state)
+    stack_record = self._require_stack(name, regional_state=regional_state)
+
+    if stack_record.state == "PENDING":
+      self._raise_client_error(
+        operation_name="DeleteStack",
+        error_code="ResourceInUseException",
+        message="Stack {name} is not AVAILABLE".format(name=name),
+      )
+
     associated_fleet_names = regional_state.stack_to_fleet_names.get(name)
 
     if associated_fleet_names is not None and len(associated_fleet_names) > 0:
@@ -728,8 +1066,6 @@ class AppStreamSimulator:
 
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
-
-    self._apply_due_transitions(resolved_region_name)
 
     session_objects = []
 
@@ -768,8 +1104,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
-
     for session_record in regional_state.sessions:
       if session_record.session_id == session_id:
         session_record.state = "EXPIRED"
@@ -793,7 +1127,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     existing_tags = regional_state.tags_by_arn.setdefault(resource_arn, {})
     existing_tags.update(tags)
 
@@ -809,7 +1142,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     existing_tags = regional_state.tags_by_arn.get(resource_arn)
 
     if existing_tags is None:
@@ -828,8 +1160,6 @@ class AppStreamSimulator:
 
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
-
-    self._apply_due_transitions(resolved_region_name)
 
     return {"Tags": dict(regional_state.tags_by_arn.get(resource_arn, {}))}
 
@@ -887,7 +1217,6 @@ class AppStreamSimulator:
     regional_state = self._regional_state(region_name)
     resolved_region_name = self._resolve_region_name(region_name)
 
-    self._apply_due_transitions(resolved_region_name)
     fleet_name = keyword_arguments["Name"]
     fleet_record = self._require_fleet(fleet_name, regional_state=regional_state)
 
@@ -900,7 +1229,145 @@ class AppStreamSimulator:
     if "MaxUserDurationInSeconds" in keyword_arguments:
       fleet_record.max_user_duration_seconds = keyword_arguments["MaxUserDurationInSeconds"]
 
-    return {"Fleet": self._fleet_object(fleet_record)}
+    if "StreamView" in keyword_arguments:
+      fleet_record.stream_view = keyword_arguments["StreamView"]
+
+    if "ComputeCapacity" in keyword_arguments:
+      compute_capacity = keyword_arguments["ComputeCapacity"]
+
+      if "DesiredInstances" in compute_capacity:
+        fleet_record.desired_instances = compute_capacity["DesiredInstances"]
+
+    return {"Fleet": self._fleet_object(fleet_record, regional_state=regional_state)}
+
+  def create_imported_image(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
+    """Start one image import; transition IMPORTING to AVAILABLE on a worker thread."""
+
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    if keyword_arguments.get("DryRun"):
+      self._raise_client_error(
+        operation_name="CreateImportedImage",
+        error_code="DryRunOperationException",
+        message="DryRun validation succeeded",
+      )
+
+    image_name = keyword_arguments["Name"]
+
+    if image_name in regional_state.image_objects_by_name:
+      self._raise_client_error(
+        operation_name="CreateImportedImage",
+        error_code="ResourceAlreadyExistsException",
+        message="Image {name} already exists".format(name=image_name),
+      )
+
+    image_arn = "arn:aws:appstream:{region}:{account}:image/{image_name}".format(
+      region=resolved_region_name,
+      account=self._config.account_id,
+      image_name=image_name,
+    )
+    applications: list[dict[str, str]] = []
+
+    if "AppCatalogConfig" in keyword_arguments:
+      for app_catalog_row in keyword_arguments["AppCatalogConfig"]:
+        applications.append({"Name": app_catalog_row["Name"]})
+
+    created_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    image_object = {
+      "Name": image_name,
+      "Arn": image_arn,
+      "State": "IMPORTING",
+      "ImageType": "CUSTOM",
+      "SourceAmiId": keyword_arguments.get("SourceAmiId", "ami-00000000"),
+      "CreatedTime": created_time,
+      "Applications": applications,
+    }
+
+    regional_state.image_objects_by_name[image_name] = image_object
+    regional_state.image_objects_by_arn[image_arn] = image_object
+    regional_state.image_lock_by_name[image_name] = threading.Lock()
+    tags = keyword_arguments.get("Tags") or {}
+
+    if len(tags) > 0:
+      regional_state.tags_by_arn[image_arn] = dict(tags)
+
+    import_delay_seconds = self._config.resolve_image_import_delay_seconds()
+    worker_thread = threading.Thread(
+      target=self._run_image_import_worker,
+      kwargs={
+        "region_name": resolved_region_name,
+        "image_name": image_name,
+        "delay_seconds": import_delay_seconds,
+      },
+      daemon=True,
+    )
+    imported_image_for_response = dict(image_object)
+    imported_image_for_response["State"] = "IMPORTING"
+    worker_thread.start()
+
+    return {"ImportedImage": imported_image_for_response}
+
+  def delete_image(
+    self,
+    *,
+    region_name: str | None = None,
+    name: str,
+  ) -> None:
+    """Delete one image when state is AVAILABLE or FAILED."""
+
+    regional_state = self._regional_state(region_name)
+    image_object = regional_state.image_objects_by_name.get(name)
+
+    if image_object is None:
+      self._raise_client_error(
+        operation_name="DeleteImage",
+        error_code="ResourceNotFoundException",
+        message="Image not found: {name}".format(name=name),
+      )
+
+    image_state = image_object["State"]
+
+    if image_state not in {"AVAILABLE", "FAILED"}:
+      self._raise_client_error(
+        operation_name="DeleteImage",
+        error_code="InvalidImageStateException",
+        message="Image {name} state={state} is not deletable".format(
+          name=name,
+          state=image_state,
+        ),
+      )
+
+    image_arn = image_object["Arn"]
+    del regional_state.image_objects_by_name[name]
+    regional_state.image_objects_by_arn.pop(image_arn, None)
+    regional_state.image_lock_by_name.pop(name, None)
+    regional_state.tags_by_arn.pop(image_arn, None)
+
+  def update_stack(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
+    """Update stack fields such as ``EmbedHostDomains``."""
+
+    regional_state = self._regional_state(region_name)
+    stack_name = keyword_arguments["Name"]
+    stack_record = self._require_stack(stack_name, regional_state=regional_state)
+
+    if "EmbedHostDomains" in keyword_arguments:
+      stack_record.embed_host_domains = list(keyword_arguments["EmbedHostDomains"])
+
+    if "DisplayName" in keyword_arguments:
+      stack_record.display_name = keyword_arguments["DisplayName"]
+
+    return {"Stack": self._stack_object(stack_record)}
 
   def seed_image(
     self,
@@ -911,6 +1378,7 @@ class AppStreamSimulator:
     image_type: str = "CUSTOM",
     state: str = "AVAILABLE",
     image_arn: str | None = None,
+    source_ami_id: str = "ami-00000000",
   ) -> None:
     """Insert one image catalog row without API calls (test helper)."""
 
@@ -927,6 +1395,7 @@ class AppStreamSimulator:
       "Arn": resolved_image_arn,
       "State": state,
       "ImageType": image_type,
+      "SourceAmiId": source_ami_id,
       "Applications": [
         {"Name": application_name}
         for application_name in resolved_application_names
@@ -935,6 +1404,7 @@ class AppStreamSimulator:
 
     regional_state.image_objects_by_name[image_name] = image_object
     regional_state.image_objects_by_arn[resolved_image_arn] = image_object
+    regional_state.image_lock_by_name[image_name] = threading.Lock()
 
   def seed_session(
     self,
@@ -982,6 +1452,7 @@ class AppStreamSimulator:
       desired_instances=desired_instances,
       image_name="seed-image",
       instance_type="stream.standard.medium",
+      lock=threading.Lock(),
     )
     self.seed_image(region_name=resolved_region_name, image_name="seed-image")
 
@@ -1003,4 +1474,5 @@ class AppStreamSimulator:
       arn=stack_arn,
       display_name=display_name or stack_name,
       state=state,
+      lock=threading.Lock(),
     )
