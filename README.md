@@ -66,13 +66,14 @@ src/creatify_as/
     fake_client.py    # FakeEc2Client (boto-shaped)
   dynamodb/
     simulator.py      # DynamoDbSimulator, DynamoDbSimulatorConfig
+    fake_client.py    # FakeDynamoDbClient (regional)
 tests/
   appstream/test_simulator.py
   ec2/test_ec2_simulator.py
   dynamodb/test_dynamodb_simulator.py
 ```
 
-There is **no** `FakeDynamoDbClient`. Creatify patches high-level `creatify_lambda.aws.dynamodb` helpers to delegate to a configured `DynamoDbSimulator` subclass (glue adapter pattern below).
+**DynamoDB:** `FakeDynamoDbClient` binds one `region_name` (default `us-east-1`) to every get/put/query/scan/transact call. Creatify integration tests patch `creatify_lambda.aws.dynamodb` helpers to delegate to `DynamoDbSimulator` with region from `AWS_REGION` (glue adapter pattern below).
 
 ---
 
@@ -377,7 +378,7 @@ cd lambda/instance_lifecycle/project
 
 **AppStream**
 
-- No multi-region isolation (one simulator; clients may set `region_name` on meta only).
+- Shared simulator process, **regional partitions**: each fake client defaults to `us-east-1`; inventory is scoped per `region_name`.
 - Pagination tokens return empty follow-up pages.
 - No IAM, service quotas, or throttling.
 - Not all boto AppStream operations exist — add to `simulator.py` + `fake_client.py` when needed.

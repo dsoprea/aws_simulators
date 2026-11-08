@@ -112,7 +112,7 @@ class Ec2Simulator:
     else:
       self._sleep_fn = time.sleep
 
-    self._instances: dict[str, _InstanceRecord] = {}
+    self._instances_by_region_name: dict[str, dict[str, _InstanceRecord]] = {}
     self._simulator_lock = threading.Lock()
     self._next_instance_sequence = 0
 
@@ -120,12 +120,35 @@ class Ec2Simulator:
     """Clear all instances, joining worker threads first."""
 
     with self._simulator_lock:
-      instance_records = list(self._instances.values())
-      self._instances.clear()
+      instance_records: list[_InstanceRecord] = []
+
+      for instances_by_id in self._instances_by_region_name.values():
+        instance_records.extend(instances_by_id.values())
+
+      self._instances_by_region_name.clear()
       self._next_instance_sequence = 0
 
     for instance_record in instance_records:
       self._shutdown_instance_worker(instance_record)
+
+  def _resolve_region_name(self, region_name: str | None) -> str:
+    """Return the effective region for one call (default from config)."""
+
+    if region_name is not None:
+      return region_name
+
+    return self._config.region_name
+
+  def _instances_for_region(self, region_name: str | None) -> dict[str, _InstanceRecord]:
+    """Return the instance map for one region, creating an empty partition when needed."""
+
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    with self._simulator_lock:
+      if resolved_region_name not in self._instances_by_region_name:
+        self._instances_by_region_name[resolved_region_name] = {}
+
+      return self._instances_by_region_name[resolved_region_name]
 
   def _raise_client_error(self, *, operation_name: str, error_code: str, message: str) -> None:
     raise ClientError(
@@ -186,11 +209,13 @@ class Ec2Simulator:
     self,
     instance_id: str,
     *,
+    region_name: str | None,
     operation_name: str,
   ) -> _InstanceRecord:
     """Return one instance row or raise ``InvalidInstanceID.NotFound``."""
 
-    instance_record = self._instances.get(instance_id)
+    instances_by_id = self._instances_for_region(region_name)
+    instance_record = instances_by_id.get(instance_id)
 
     if instance_record is None:
       self._raise_client_error(
@@ -342,6 +367,7 @@ class Ec2Simulator:
   def seed_instance(
     self,
     *,
+    region_name: str | None = None,
     instance_id: str | None = None,
     instance_type: str,
     image_id: str,
@@ -376,19 +402,27 @@ class Ec2Simulator:
       launch_time=self._time_fn(),
     )
 
+    instances_by_id = self._instances_for_region(region_name)
+
     with self._simulator_lock:
-      if resolved_instance_id in self._instances:
+      if resolved_instance_id in instances_by_id:
         raise ValueError(
-          "instance_id={instance_id} already exists".format(
+          "instance_id={instance_id} already exists in region={region_name}".format(
             instance_id=resolved_instance_id,
+            region_name=self._resolve_region_name(region_name),
           ),
         )
 
-      self._instances[resolved_instance_id] = instance_record
+      instances_by_id[resolved_instance_id] = instance_record
 
     return resolved_instance_id
 
-  def run_instances(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+  def run_instances(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
     """Launch one instance into ``pending``, then ``running`` after the platform start delay."""
 
     min_count = keyword_arguments.get("MinCount", 1)
@@ -419,8 +453,10 @@ class Ec2Simulator:
       launch_time=self._time_fn(),
     )
 
+    instances_by_id = self._instances_for_region(region_name)
+
     with self._simulator_lock:
-      self._instances[instance_id] = instance_record
+      instances_by_id[instance_id] = instance_record
 
     delay_seconds = self._start_delay_seconds(platform_type)
     self._enqueue_transition(
@@ -436,7 +472,12 @@ class Ec2Simulator:
       "ReservationId": "r-{token}".format(token=secrets.token_hex(8)),
     }
 
-  def start_instances(self, *, instance_ids: list[str]) -> dict[str, typing.Any]:
+  def start_instances(
+    self,
+    *,
+    region_name: str | None = None,
+    instance_ids: list[str],
+  ) -> dict[str, typing.Any]:
     """Move stopped instances to ``pending``, then ``running``."""
 
     starting_instances: list[dict[str, typing.Any]] = []
@@ -444,6 +485,7 @@ class Ec2Simulator:
     for instance_id in instance_ids:
       instance_record = self._require_instance(
         instance_id,
+        region_name=region_name,
         operation_name="StartInstances",
       )
 
@@ -488,7 +530,12 @@ class Ec2Simulator:
 
     return {"StartingInstances": starting_instances}
 
-  def stop_instances(self, *, instance_ids: list[str]) -> dict[str, typing.Any]:
+  def stop_instances(
+    self,
+    *,
+    region_name: str | None = None,
+    instance_ids: list[str],
+  ) -> dict[str, typing.Any]:
     """Move running instances to ``stopping``, then ``stopped``."""
 
     stopping_instances: list[dict[str, typing.Any]] = []
@@ -496,6 +543,7 @@ class Ec2Simulator:
     for instance_id in instance_ids:
       instance_record = self._require_instance(
         instance_id,
+        region_name=region_name,
         operation_name="StopInstances",
       )
 
@@ -541,7 +589,12 @@ class Ec2Simulator:
 
     return {"StoppingInstances": stopping_instances}
 
-  def terminate_instances(self, *, instance_ids: list[str]) -> dict[str, typing.Any]:
+  def terminate_instances(
+    self,
+    *,
+    region_name: str | None = None,
+    instance_ids: list[str],
+  ) -> dict[str, typing.Any]:
     """Enter ``shutting-down``, then ``terminated`` after the platform terminate delay."""
 
     terminating_instances: list[dict[str, typing.Any]] = []
@@ -549,6 +602,7 @@ class Ec2Simulator:
     for instance_id in instance_ids:
       instance_record = self._require_instance(
         instance_id,
+        region_name=region_name,
         operation_name="TerminateInstances",
       )
 
@@ -597,6 +651,7 @@ class Ec2Simulator:
   def create_tags(
     self,
     *,
+    region_name: str | None = None,
     resource_ids: list[str],
     tags: list[dict[str, str]],
   ) -> None:
@@ -605,6 +660,7 @@ class Ec2Simulator:
     for resource_id in resource_ids:
       instance_record = self._require_instance(
         resource_id,
+        region_name=region_name,
         operation_name="CreateTags",
       )
 
@@ -677,15 +733,17 @@ class Ec2Simulator:
   def describe_instances(
     self,
     *,
+    region_name: str | None = None,
     instance_ids: list[str] | None = None,
     filters: list[dict[str, typing.Any]] | None = None,
   ) -> dict[str, typing.Any]:
     """Return Reservations/Instances for optional id list and supported filters."""
 
     matched_instance_objects: list[dict[str, typing.Any]] = []
+    instances_by_id = self._instances_for_region(region_name)
 
     with self._simulator_lock:
-      instance_records = list(self._instances.values())
+      instance_records = list(instances_by_id.values())
 
     for instance_record in instance_records:
       if instance_ids is not None:
@@ -710,11 +768,17 @@ class Ec2Simulator:
       ],
     }
 
-  def gather_instance_state_name(self, instance_id: str) -> str:
+  def gather_instance_state_name(
+    self,
+    instance_id: str,
+    *,
+    region_name: str | None = None,
+  ) -> str:
     """Return the current ``State.Name`` for one instance (test helper)."""
 
     instance_record = self._require_instance(
       instance_id,
+      region_name=region_name,
       operation_name="DescribeInstances",
     )
 
@@ -726,6 +790,7 @@ class Ec2Simulator:
     instance_id: str,
     state_name: str,
     *,
+    region_name: str | None = None,
     timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 0.01,
   ) -> None:
@@ -734,7 +799,9 @@ class Ec2Simulator:
     deadline = self._time_fn() + timeout_seconds
 
     while self._time_fn() < deadline:
-      current_state_name = self.gather_instance_state_name(instance_id)
+      current_state_name = self.gather_instance_state_name(
+        instance_id,
+        region_name=region_name)
 
       if current_state_name == state_name:
         return

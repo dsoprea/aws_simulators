@@ -20,6 +20,7 @@ class DynamoDbSimulatorConfig:
   allowed_table_names: frozenset[str]
   table_primary_key_attribute_names_by_table_name: dict[str, tuple[str, ...]]
   gsi_key_attribute_names_by_index_name: dict[str, tuple[str, str | None]]
+  default_region_name: str = "us-east-1"
 
 
 def _deserialize_attribute_value(attribute_map: dict[str, typing.Any]) -> typing.Any:
@@ -446,12 +447,46 @@ class DynamoDbSimulator:
 
   def __init__(self, config: DynamoDbSimulatorConfig) -> None:
     self._config = config
-    self._items_by_table_name_and_primary_key: dict[str, dict[tuple[typing.Any, ...], dict[str, typing.Any]]] = {}
+    self._items_by_region_name_and_table_name_and_primary_key: dict[
+      str,
+      dict[str, dict[tuple[typing.Any, ...], dict[str, typing.Any]]],
+    ] = {}
 
-  def clear(self) -> None:
-    """Remove every stored table row."""
+  def clear(self, *, region_name: str | None = None) -> None:
+    """Remove every stored table row, optionally for one region only."""
 
-    self._items_by_table_name_and_primary_key = {}
+    if region_name is not None:
+      resolved_region_name = self._resolve_region_name(region_name)
+      self._items_by_region_name_and_table_name_and_primary_key.pop(resolved_region_name, None)
+
+      return
+
+    self._items_by_region_name_and_table_name_and_primary_key = {}
+
+  def _resolve_region_name(self, region_name: str | None) -> str:
+    """Return the effective region for one call (default from config)."""
+
+    if region_name is not None:
+      return region_name
+
+    return self._config.default_region_name
+
+  def _table_items(
+    self,
+    table_name: str,
+    *,
+    region_name: str | None,
+  ) -> dict[tuple[typing.Any, ...], dict[str, typing.Any]]:
+    """Return the row map for one regional table partition, creating empty storage when needed."""
+
+    self._ensure_table_name(table_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+    items_by_table_name = self._items_by_region_name_and_table_name_and_primary_key.setdefault(
+      resolved_region_name,
+      {},
+    )
+
+    return items_by_table_name.setdefault(table_name, {})
 
   def _build_row_primary_key_tuple(self, table_name: str, key: dict[str, typing.Any]) -> tuple[typing.Any, ...]:
     """Return the storage key tuple for one row primary key."""
@@ -461,24 +496,30 @@ class DynamoDbSimulator:
       key,
       self._config.table_primary_key_attribute_names_by_table_name)
 
-  def seed_item(self, table_name: str, item: dict[str, typing.Any]) -> None:
+  def seed_item(
+    self,
+    table_name: str,
+    item: dict[str, typing.Any],
+    *,
+    region_name: str | None = None,
+  ) -> None:
     """Insert or replace one row for test setup."""
 
-    self._ensure_table_name(table_name)
     primary_key_tuple = self._build_row_primary_key_tuple(table_name, item)
-    table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     table_items[primary_key_tuple] = copy.deepcopy(item)
 
   def get_item_or_none(
     self,
     table_name: str,
     key: dict[str, typing.Any],
+    *,
+    region_name: str | None = None,
   ) -> dict[str, typing.Any] | None:
     """Return one row for *key*, or ``None`` when absent."""
 
-    self._ensure_table_name(table_name)
     primary_key_tuple = self._build_row_primary_key_tuple(table_name, key)
-    table_items = self._items_by_table_name_and_primary_key.get(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     stored_item = table_items.get(primary_key_tuple)
 
     if stored_item is None:
@@ -491,15 +532,15 @@ class DynamoDbSimulator:
     table_name: str,
     item: dict[str, typing.Any],
     *,
+    region_name: str | None = None,
     condition_expression: str | None = None,
     expression_attribute_names: dict[str, str] | None = None,
     expression_attribute_values: dict[str, typing.Any] | None = None,
   ) -> None:
     """Upsert one row, optionally guarded by a condition expression."""
 
-    self._ensure_table_name(table_name)
     primary_key_tuple = self._build_row_primary_key_tuple(table_name, item)
-    table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     existing_item = table_items.get(primary_key_tuple, {})
 
     if condition_expression is not None:
@@ -517,6 +558,7 @@ class DynamoDbSimulator:
     table_name: str,
     key: dict[str, typing.Any],
     *,
+    region_name: str | None = None,
     update_expression: str,
     condition_expression: str | None = None,
     expression_attribute_names: dict[str, str] | None = None,
@@ -524,9 +566,8 @@ class DynamoDbSimulator:
   ) -> dict[str, typing.Any]:
     """Apply one update expression to one row and return a minimal response."""
 
-    self._ensure_table_name(table_name)
     primary_key_tuple = self._build_row_primary_key_tuple(table_name, key)
-    table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     existing_item = table_items.get(primary_key_tuple)
 
     if existing_item is None:
@@ -561,15 +602,15 @@ class DynamoDbSimulator:
     table_name: str,
     key: dict[str, typing.Any],
     *,
+    region_name: str | None = None,
     condition_expression: str | None = None,
     expression_attribute_names: dict[str, str] | None = None,
     expression_attribute_values: dict[str, typing.Any] | None = None,
   ) -> dict[str, typing.Any]:
     """Delete one row when its condition expression passes."""
 
-    self._ensure_table_name(table_name)
     primary_key_tuple = self._build_row_primary_key_tuple(table_name, key)
-    table_items = self._items_by_table_name_and_primary_key.get(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     existing_item = table_items.get(primary_key_tuple, {})
 
     if condition_expression is not None:
@@ -592,14 +633,15 @@ class DynamoDbSimulator:
   def query_collect_items(
     self,
     table_name: str,
+    *,
+    region_name: str | None = None,
     **query_keyword_arguments: typing.Any,
   ) -> list[dict[str, typing.Any]]:
     """Return rows matching one key-condition expression."""
 
-    self._ensure_table_name(table_name)
     index_name = query_keyword_arguments.get("IndexName")
     key_condition_expression = query_keyword_arguments.get("KeyConditionExpression")
-    table_items = self._items_by_table_name_and_primary_key.get(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     matching_items: list[dict[str, typing.Any]] = []
 
     for stored_item in table_items.values():
@@ -646,11 +688,16 @@ class DynamoDbSimulator:
   def query_first_item_or_none(
     self,
     table_name: str,
+    *,
+    region_name: str | None = None,
     **query_keyword_arguments: typing.Any,
   ) -> dict[str, typing.Any] | None:
     """Return the first query row, or ``None`` when no row matches."""
 
-    matching_items = self.query_collect_items(table_name, **query_keyword_arguments)
+    matching_items = self.query_collect_items(
+      table_name,
+      region_name=region_name,
+      **query_keyword_arguments)
 
     if len(matching_items) < 1:
       return None
@@ -660,13 +707,14 @@ class DynamoDbSimulator:
   def scan_collect_items(
     self,
     table_name: str,
+    *,
+    region_name: str | None = None,
     **scan_keyword_arguments: typing.Any,
   ) -> list[dict[str, typing.Any]]:
     """Return every row in *table_name*, optionally filtered by ``FilterExpression``."""
 
-    self._ensure_table_name(table_name)
     filter_expression = scan_keyword_arguments.get("FilterExpression")
-    table_items = self._items_by_table_name_and_primary_key.get(table_name, {})
+    table_items = self._table_items(table_name, region_name=region_name)
     matching_items: list[dict[str, typing.Any]] = []
 
     for stored_item in table_items.values():
@@ -685,12 +733,17 @@ class DynamoDbSimulator:
 
     return matching_items
 
-  def scan_all_items(self, table_name: str) -> list[dict[str, typing.Any]]:
+  def scan_all_items(self, table_name: str, *, region_name: str | None = None) -> list[dict[str, typing.Any]]:
     """Return every row stored for *table_name*."""
 
-    return self.scan_collect_items(table_name)
+    return self.scan_collect_items(table_name, region_name=region_name)
 
-  def transact_write_items(self, transact_items: list[dict[str, typing.Any]]) -> None:
+  def transact_write_items(
+    self,
+    transact_items: list[dict[str, typing.Any]],
+    *,
+    region_name: str | None = None,
+  ) -> None:
     """Execute one ``TransactWriteItems`` request against the in-memory tables."""
 
     staged_writes: list[tuple[str, tuple[typing.Any, ...], dict[str, typing.Any] | None]] = []
@@ -702,7 +755,7 @@ class DynamoDbSimulator:
         self._ensure_table_name(table_name)
         item = _deserialize_item(put_request["Item"])
         primary_key_tuple = self._build_row_primary_key_tuple(table_name, item)
-        table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+        table_items = self._table_items(table_name, region_name=region_name)
         existing_item = table_items.get(primary_key_tuple, {})
         condition_expression = put_request.get("ConditionExpression")
         expression_attribute_names = put_request.get("ExpressionAttributeNames")
@@ -731,7 +784,7 @@ class DynamoDbSimulator:
         self._ensure_table_name(table_name)
         key = _deserialize_key(update_request["Key"])
         primary_key_tuple = self._build_row_primary_key_tuple(table_name, key)
-        table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+        table_items = self._table_items(table_name, region_name=region_name)
         existing_item = table_items.get(primary_key_tuple)
 
         if existing_item is None:
@@ -765,7 +818,7 @@ class DynamoDbSimulator:
         self._ensure_table_name(table_name)
         key = _deserialize_key(delete_request["Key"])
         primary_key_tuple = self._build_row_primary_key_tuple(table_name, key)
-        table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+        table_items = self._table_items(table_name, region_name=region_name)
         existing_item = table_items.get(primary_key_tuple, {})
         expression_attribute_values = None
 
@@ -790,7 +843,7 @@ class DynamoDbSimulator:
       raise ValueError("unsupported transact item shape")
 
     for table_name, primary_key_tuple, item in staged_writes:
-      table_items = self._items_by_table_name_and_primary_key.setdefault(table_name, {})
+      table_items = self._table_items(table_name, region_name=region_name)
 
       if item is None:
         if primary_key_tuple in table_items:

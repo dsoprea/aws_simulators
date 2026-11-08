@@ -64,6 +64,22 @@ class _SessionRecord:
   state: str
 
 
+@dataclasses.dataclass
+class _RegionalState:
+  """In-memory AppStream inventory for one AWS region."""
+
+  fleets: dict[str, _FleetRecord] = dataclasses.field(default_factory=dict)
+  stacks: dict[str, _StackRecord] = dataclasses.field(default_factory=dict)
+  fleet_to_stack_name: dict[str, str] = dataclasses.field(default_factory=dict)
+  stack_to_fleet_names: dict[str, set[str]] = dataclasses.field(default_factory=dict)
+  tags_by_arn: dict[str, dict[str, str]] = dataclasses.field(default_factory=dict)
+  sessions: list[_SessionRecord] = dataclasses.field(default_factory=list)
+  scheduled_transitions: list[_ScheduledTransition] = dataclasses.field(default_factory=list)
+  streaming_url_counter: int = 0
+  image_objects_by_name: dict[str, dict[str, typing.Any]] = dataclasses.field(default_factory=dict)
+  image_objects_by_arn: dict[str, dict[str, typing.Any]] = dataclasses.field(default_factory=dict)
+
+
 class AppStreamSimulator:
   """Models fleet, stack, association, session, and streaming URL AppStream semantics."""
 
@@ -86,31 +102,31 @@ class AppStreamSimulator:
     else:
       self._sleep_fn = time.sleep
 
-    self._fleets: dict[str, _FleetRecord] = {}
-    self._stacks: dict[str, _StackRecord] = {}
-    self._fleet_to_stack_name: dict[str, str] = {}
-    self._stack_to_fleet_names: dict[str, set[str]] = {}
-    self._tags_by_arn: dict[str, dict[str, str]] = {}
-    self._sessions: list[_SessionRecord] = []
-    self._scheduled_transitions: list[_ScheduledTransition] = []
-    self._streaming_url_counter = 0
-    self._image_objects_by_name: dict[str, dict[str, typing.Any]] = {}
-    self._image_objects_by_arn: dict[str, dict[str, typing.Any]] = {}
+    self._regional_state_by_region_name: dict[str, _RegionalState] = {}
 
   def reset(self) -> None:
     """Clear all simulator state (use between tests)."""
 
-    self._fleets.clear()
-    self._stacks.clear()
-    self._fleet_to_stack_name.clear()
-    self._stack_to_fleet_names.clear()
-    self._tags_by_arn.clear()
-    self._sessions.clear()
-    self._scheduled_transitions.clear()
-    self._streaming_url_counter = 0
-    self._image_objects_by_name.clear()
-    self._image_objects_by_arn.clear()
+    self._regional_state_by_region_name.clear()
     self._virtual_clock_seconds = 0.0
+
+  def _resolve_region_name(self, region_name: str | None) -> str:
+    """Return the effective region for one call (default from config)."""
+
+    if region_name is not None:
+      return region_name
+
+    return self._config.region_name
+
+  def _regional_state(self, region_name: str | None) -> _RegionalState:
+    """Return regional inventory, creating an empty partition when needed."""
+
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    if resolved_region_name not in self._regional_state_by_region_name:
+      self._regional_state_by_region_name[resolved_region_name] = _RegionalState()
+
+    return self._regional_state_by_region_name[resolved_region_name]
 
   def advance_time(self, seconds: float) -> None:
     """Advance the virtual clock and apply due state transitions."""
@@ -127,38 +143,50 @@ class AppStreamSimulator:
   def _advance_virtual_clock(self, seconds: float) -> None:
     self.advance_time(seconds)
 
-  def _apply_due_transitions(self) -> None:
+  def _apply_due_transitions(self, region_name: str | None = None) -> None:
+    if region_name is not None:
+      self._apply_due_transitions_for_state(self._regional_state(region_name))
+
+      return
+
+    for regional_state in self._regional_state_by_region_name.values():
+      self._apply_due_transitions_for_state(regional_state)
+
+  def _apply_due_transitions_for_state(self, regional_state: _RegionalState) -> None:
     current_time = self._now()
     remaining_transitions: list[_ScheduledTransition] = []
 
-    for scheduled_transition in sorted(self._scheduled_transitions, key=lambda row: row.fire_at):
+    for scheduled_transition in sorted(
+      regional_state.scheduled_transitions,
+      key=lambda row: row.fire_at):
       if scheduled_transition.fire_at > current_time:
         remaining_transitions.append(scheduled_transition)
         continue
 
       if scheduled_transition.resource_kind == "fleet":
-        fleet_record = self._fleets.get(scheduled_transition.resource_name)
+        fleet_record = regional_state.fleets.get(scheduled_transition.resource_name)
 
         if fleet_record is not None:
           fleet_record.state = scheduled_transition.target_state
 
       if scheduled_transition.resource_kind == "stack":
-        stack_record = self._stacks.get(scheduled_transition.resource_name)
+        stack_record = regional_state.stacks.get(scheduled_transition.resource_name)
 
         if stack_record is not None:
           stack_record.state = scheduled_transition.target_state
 
-    self._scheduled_transitions = remaining_transitions
+    regional_state.scheduled_transitions = remaining_transitions
 
   def _schedule_transition(
     self,
     *,
+    regional_state: _RegionalState,
     resource_kind: str,
     resource_name: str,
     target_state: str,
     delay_seconds: float,
   ) -> None:
-    self._scheduled_transitions.append(
+    regional_state.scheduled_transitions.append(
       _ScheduledTransition(
         fire_at=self._now() + delay_seconds,
         resource_kind=resource_kind,
@@ -167,16 +195,16 @@ class AppStreamSimulator:
       ),
     )
 
-  def _build_fleet_arn(self, fleet_name: str) -> str:
+  def _build_fleet_arn(self, fleet_name: str, *, region_name: str) -> str:
     return "arn:aws:appstream:{region}:{account}:fleet/{name}".format(
-      region=self._config.region_name,
+      region=region_name,
       account=self._config.account_id,
       name=fleet_name,
     )
 
-  def _build_stack_arn(self, stack_name: str) -> str:
+  def _build_stack_arn(self, stack_name: str, *, region_name: str) -> str:
     return "arn:aws:appstream:{region}:{account}:stack/{name}".format(
-      region=self._config.region_name,
+      region=region_name,
       account=self._config.account_id,
       name=stack_name,
     )
@@ -263,8 +291,8 @@ class AppStreamSimulator:
       operation_name,
     )
 
-  def _require_fleet(self, fleet_name: str) -> _FleetRecord:
-    fleet_record = self._fleets.get(fleet_name)
+  def _require_fleet(self, fleet_name: str, *, regional_state: _RegionalState) -> _FleetRecord:
+    fleet_record = regional_state.fleets.get(fleet_name)
 
     if fleet_record is None:
       self._raise_client_error(
@@ -275,8 +303,8 @@ class AppStreamSimulator:
 
     return fleet_record
 
-  def _require_stack(self, stack_name: str) -> _StackRecord:
-    stack_record = self._stacks.get(stack_name)
+  def _require_stack(self, stack_name: str, *, regional_state: _RegionalState) -> _StackRecord:
+    stack_record = regional_state.stacks.get(stack_name)
 
     if stack_record is None:
       self._raise_client_error(
@@ -287,14 +315,23 @@ class AppStreamSimulator:
 
     return stack_record
 
-  def associate_fleet(self, *, fleet_name: str, stack_name: str) -> None:
+  def associate_fleet(
+    self,
+    *,
+    region_name: str | None = None,
+    fleet_name: str,
+    stack_name: str,
+  ) -> None:
     """Associate one fleet with one stack; enforce one stack per fleet."""
 
-    self._apply_due_transitions()
-    self._require_fleet(fleet_name)
-    self._require_stack(stack_name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
 
-    existing_stack_name = self._fleet_to_stack_name.get(fleet_name)
+    self._apply_due_transitions(resolved_region_name)
+    self._require_fleet(fleet_name, regional_state=regional_state)
+    self._require_stack(stack_name, regional_state=regional_state)
+
+    existing_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
 
     if existing_stack_name is not None and existing_stack_name != stack_name:
       attached_count = 2
@@ -313,37 +350,55 @@ class AppStreamSimulator:
     if existing_stack_name == stack_name:
       return
 
-    self._fleet_to_stack_name[fleet_name] = stack_name
-    self._stack_to_fleet_names.setdefault(stack_name, set()).add(fleet_name)
+    regional_state.fleet_to_stack_name[fleet_name] = stack_name
+    regional_state.stack_to_fleet_names.setdefault(stack_name, set()).add(fleet_name)
 
-  def disassociate_fleet(self, *, fleet_name: str, stack_name: str) -> None:
+  def disassociate_fleet(
+    self,
+    *,
+    region_name: str | None = None,
+    fleet_name: str,
+    stack_name: str,
+  ) -> None:
     """Remove one fleet-stack association."""
 
-    self._apply_due_transitions()
-    existing_stack_name = self._fleet_to_stack_name.get(fleet_name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    existing_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
 
     if existing_stack_name != stack_name:
       return
 
-    del self._fleet_to_stack_name[fleet_name]
-    fleet_names_for_stack = self._stack_to_fleet_names.get(stack_name)
+    del regional_state.fleet_to_stack_name[fleet_name]
+    fleet_names_for_stack = regional_state.stack_to_fleet_names.get(stack_name)
 
     if fleet_names_for_stack is not None:
       fleet_names_for_stack.discard(fleet_name)
 
       if len(fleet_names_for_stack) < 1:
-        del self._stack_to_fleet_names[stack_name]
+        del regional_state.stack_to_fleet_names[stack_name]
 
-  def list_associated_stacks(self, *, fleet_name: str, next_token: str | None = None) -> dict[str, typing.Any]:
+  def list_associated_stacks(
+    self,
+    *,
+    region_name: str | None = None,
+    fleet_name: str,
+    next_token: str | None = None,
+  ) -> dict[str, typing.Any]:
     """Return stack names linked to one fleet."""
 
-    self._apply_due_transitions()
-    self._require_fleet(fleet_name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    self._require_fleet(fleet_name, regional_state=regional_state)
 
     if next_token is not None:
       return {"Names": []}
 
-    associated_stack_name = self._fleet_to_stack_name.get(fleet_name)
+    associated_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
     associated_stack_names = []
 
     if associated_stack_name is not None:
@@ -351,22 +406,32 @@ class AppStreamSimulator:
 
     return {"Names": associated_stack_names}
 
-  def list_associated_fleets(self, *, stack_name: str, next_token: str | None = None) -> dict[str, typing.Any]:
+  def list_associated_fleets(
+    self,
+    *,
+    region_name: str | None = None,
+    stack_name: str,
+    next_token: str | None = None,
+  ) -> dict[str, typing.Any]:
     """Return fleet names linked to one stack."""
 
-    self._apply_due_transitions()
-    self._require_stack(stack_name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    self._require_stack(stack_name, regional_state=regional_state)
 
     if next_token is not None:
       return {"Names": []}
 
-    associated_fleet_names = sorted(self._stack_to_fleet_names.get(stack_name, set()))
+    associated_fleet_names = sorted(regional_state.stack_to_fleet_names.get(stack_name, set()))
 
     return {"Names": associated_fleet_names}
 
   def create_streaming_url(
     self,
     *,
+    region_name: str | None = None,
     stack_name: str,
     fleet_name: str,
     user_id: str,
@@ -376,11 +441,14 @@ class AppStreamSimulator:
   ) -> dict[str, typing.Any]:
     """Create a deterministic streaming URL and record one session."""
 
-    self._apply_due_transitions()
-    self._require_fleet(fleet_name)
-    self._require_stack(stack_name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
 
-    associated_stack_name = self._fleet_to_stack_name.get(fleet_name)
+    self._apply_due_transitions(resolved_region_name)
+    self._require_fleet(fleet_name, regional_state=regional_state)
+    self._require_stack(stack_name, regional_state=regional_state)
+
+    associated_stack_name = regional_state.fleet_to_stack_name.get(fleet_name)
 
     if associated_stack_name != stack_name:
       self._raise_client_error(
@@ -392,19 +460,19 @@ class AppStreamSimulator:
         ),
       )
 
-    self._streaming_url_counter = self._streaming_url_counter + 1
-    session_id = "sim-session-{counter}".format(counter=self._streaming_url_counter)
+    regional_state.streaming_url_counter = regional_state.streaming_url_counter + 1
+    session_id = "sim-session-{counter}".format(counter=regional_state.streaming_url_counter)
     streaming_url = (
       "https://appstream.{region}.amazonaws.com/authenticate?"
       "parameters=sim-{session_id}-{user_id}"
     ).format(
-      region=self._config.region_name,
+      region=resolved_region_name,
       session_id=session_id,
       user_id=user_id,
     )
     expires_at = self._now() + validity
 
-    self._sessions.append(
+    regional_state.sessions.append(
       _SessionRecord(
         session_id=session_id,
         stack_name=stack_name,
@@ -422,18 +490,22 @@ class AppStreamSimulator:
   def describe_fleets(
     self,
     *,
+    region_name: str | None = None,
     names: list[str] | None = None,
     next_token: str | None = None,
   ) -> dict[str, typing.Any]:
     """Return fleet objects visible in the simulator."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
 
     if names is not None:
       fleet_objects = []
 
       for fleet_name in names:
-        fleet_record = self._fleets.get(fleet_name)
+        fleet_record = regional_state.fleets.get(fleet_name)
 
         if fleet_record is not None:
           fleet_objects.append(self._fleet_object(fleet_record))
@@ -442,7 +514,7 @@ class AppStreamSimulator:
 
     fleet_objects = [
       self._fleet_object(fleet_record)
-      for fleet_record in self._fleets.values()
+      for fleet_record in regional_state.fleets.values()
     ]
 
     return self._build_paginated_object_list_response(
@@ -454,18 +526,22 @@ class AppStreamSimulator:
   def describe_stacks(
     self,
     *,
+    region_name: str | None = None,
     names: list[str] | None = None,
     next_token: str | None = None,
   ) -> dict[str, typing.Any]:
     """Return stack objects visible in the simulator."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
 
     if names is not None:
       stack_objects = []
 
       for stack_name in names:
-        stack_record = self._stacks.get(stack_name)
+        stack_record = regional_state.stacks.get(stack_name)
 
         if stack_record is not None:
           stack_objects.append(self._stack_object(stack_record))
@@ -474,7 +550,7 @@ class AppStreamSimulator:
 
     stack_objects = [
       self._stack_object(stack_record)
-      for stack_record in self._stacks.values()
+      for stack_record in regional_state.stacks.values()
     ]
 
     return self._build_paginated_object_list_response(
@@ -483,12 +559,20 @@ class AppStreamSimulator:
       next_token=next_token,
     )
 
-  def create_fleet(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+  def create_fleet(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
     """Create one fleet in STOPPED state until ``start_fleet`` is called."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
     fleet_name = keyword_arguments["Name"]
-    fleet_arn = self._build_fleet_arn(fleet_name)
+    fleet_arn = self._build_fleet_arn(fleet_name, region_name=resolved_region_name)
     desired_instances = keyword_arguments.get("ComputeCapacity", {}).get("DesiredInstances", 1)
     fleet_record = _FleetRecord(
       name=fleet_name,
@@ -501,73 +585,92 @@ class AppStreamSimulator:
       max_user_duration_seconds=keyword_arguments.get("MaxUserDurationInSeconds"),
     )
 
-    self._fleets[fleet_name] = fleet_record
+    regional_state.fleets[fleet_name] = fleet_record
     tags = keyword_arguments.get("Tags") or {}
 
     if len(tags) > 0:
-      self._tags_by_arn[fleet_arn] = dict(tags)
+      regional_state.tags_by_arn[fleet_arn] = dict(tags)
 
     return {"Fleet": self._fleet_object(fleet_record)}
 
-  def start_fleet(self, *, name: str) -> None:
+  def start_fleet(self, *, region_name: str | None = None, name: str) -> None:
     """Move a STOPPED fleet to STARTING then RUNNING."""
 
-    self._apply_due_transitions()
-    fleet_record = self._require_fleet(name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    fleet_record = self._require_fleet(name, regional_state=regional_state)
 
     if fleet_record.state in {"RUNNING", "STARTING"}:
       return
 
     fleet_record.state = "STARTING"
     self._schedule_transition(
+      regional_state=regional_state,
       resource_kind="fleet",
       resource_name=name,
       target_state="RUNNING",
       delay_seconds=self._config.fleet_state_transition_delay_seconds,
     )
 
-  def stop_fleet(self, *, name: str) -> None:
+  def stop_fleet(self, *, region_name: str | None = None, name: str) -> None:
     """Move a RUNNING fleet to STOPPING then STOPPED."""
 
-    self._apply_due_transitions()
-    fleet_record = self._require_fleet(name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    fleet_record = self._require_fleet(name, regional_state=regional_state)
 
     if fleet_record.state in {"STOPPED", "STOPPING"}:
       return
 
     fleet_record.state = "STOPPING"
     self._schedule_transition(
+      regional_state=regional_state,
       resource_kind="fleet",
       resource_name=name,
       target_state="STOPPED",
       delay_seconds=self._config.fleet_state_transition_delay_seconds,
     )
 
-  def delete_fleet(self, *, name: str) -> None:
+  def delete_fleet(self, *, region_name: str | None = None, name: str) -> None:
     """Delete one fleet and clear associations."""
 
-    self._apply_due_transitions()
-    self._require_fleet(name)
-    associated_stack_name = self._fleet_to_stack_name.pop(name, None)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    self._require_fleet(name, regional_state=regional_state)
+    associated_stack_name = regional_state.fleet_to_stack_name.pop(name, None)
 
     if associated_stack_name is not None:
-      fleet_names_for_stack = self._stack_to_fleet_names.get(associated_stack_name)
+      fleet_names_for_stack = regional_state.stack_to_fleet_names.get(associated_stack_name)
 
       if fleet_names_for_stack is not None:
         fleet_names_for_stack.discard(name)
 
         if len(fleet_names_for_stack) < 1:
-          del self._stack_to_fleet_names[associated_stack_name]
+          del regional_state.stack_to_fleet_names[associated_stack_name]
 
-    fleet_record = self._fleets.pop(name)
-    self._tags_by_arn.pop(fleet_record.arn, None)
+    fleet_record = regional_state.fleets.pop(name)
+    regional_state.tags_by_arn.pop(fleet_record.arn, None)
 
-  def create_stack(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+  def create_stack(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
     """Create one stack in PENDING state and schedule AVAILABLE after the stack delay."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
     stack_name = keyword_arguments["Name"]
-    stack_arn = self._build_stack_arn(stack_name)
+    stack_arn = self._build_stack_arn(stack_name, region_name=resolved_region_name)
     stack_record = _StackRecord(
       name=stack_name,
       arn=stack_arn,
@@ -575,13 +678,14 @@ class AppStreamSimulator:
       state="PENDING",
     )
 
-    self._stacks[stack_name] = stack_record
+    regional_state.stacks[stack_name] = stack_record
     tags = keyword_arguments.get("Tags") or {}
 
     if len(tags) > 0:
-      self._tags_by_arn[stack_arn] = dict(tags)
+      regional_state.tags_by_arn[stack_arn] = dict(tags)
 
     self._schedule_transition(
+      regional_state=regional_state,
       resource_kind="stack",
       resource_name=stack_name,
       target_state="AVAILABLE",
@@ -590,12 +694,15 @@ class AppStreamSimulator:
 
     return {"Stack": self._stack_object(stack_record)}
 
-  def delete_stack(self, *, name: str) -> None:
+  def delete_stack(self, *, region_name: str | None = None, name: str) -> None:
     """Delete one stack when no fleets remain associated."""
 
-    self._apply_due_transitions()
-    self._require_stack(name)
-    associated_fleet_names = self._stack_to_fleet_names.get(name)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    self._require_stack(name, regional_state=regional_state)
+    associated_fleet_names = regional_state.stack_to_fleet_names.get(name)
 
     if associated_fleet_names is not None and len(associated_fleet_names) > 0:
       self._raise_client_error(
@@ -604,12 +711,13 @@ class AppStreamSimulator:
         message="Stack {name} is associated with fleets".format(name=name),
       )
 
-    stack_record = self._stacks.pop(name)
-    self._tags_by_arn.pop(stack_record.arn, None)
+    stack_record = regional_state.stacks.pop(name)
+    regional_state.tags_by_arn.pop(stack_record.arn, None)
 
   def describe_sessions(
     self,
     *,
+    region_name: str | None = None,
     stack_name: str,
     fleet_name: str,
     user_id: str | None = None,
@@ -618,11 +726,14 @@ class AppStreamSimulator:
   ) -> dict[str, typing.Any]:
     """Return active sessions for one fleet and stack."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
 
     session_objects = []
 
-    for session_record in self._sessions:
+    for session_record in regional_state.sessions:
       if session_record.state != "ACTIVE":
         continue
 
@@ -651,12 +762,15 @@ class AppStreamSimulator:
       next_token=next_token,
     )
 
-  def expire_session(self, *, session_id: str) -> None:
+  def expire_session(self, *, region_name: str | None = None, session_id: str) -> None:
     """Mark one session expired."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
 
-    for session_record in self._sessions:
+    self._apply_due_transitions(resolved_region_name)
+
+    for session_record in regional_state.sessions:
       if session_record.session_id == session_id:
         session_record.state = "EXPIRED"
         return
@@ -667,18 +781,36 @@ class AppStreamSimulator:
       message="Session not found: {session_id}".format(session_id=session_id),
     )
 
-  def tag_resource(self, *, resource_arn: str, tags: dict[str, str]) -> None:
+  def tag_resource(
+    self,
+    *,
+    region_name: str | None = None,
+    resource_arn: str,
+    tags: dict[str, str],
+  ) -> None:
     """Attach tags to one fleet or stack ARN."""
 
-    self._apply_due_transitions()
-    existing_tags = self._tags_by_arn.setdefault(resource_arn, {})
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    existing_tags = regional_state.tags_by_arn.setdefault(resource_arn, {})
     existing_tags.update(tags)
 
-  def untag_resource(self, *, resource_arn: str, tag_keys: list[str]) -> None:
+  def untag_resource(
+    self,
+    *,
+    region_name: str | None = None,
+    resource_arn: str,
+    tag_keys: list[str],
+  ) -> None:
     """Remove tags from one fleet or stack ARN."""
 
-    self._apply_due_transitions()
-    existing_tags = self._tags_by_arn.get(resource_arn)
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
+    existing_tags = regional_state.tags_by_arn.get(resource_arn)
 
     if existing_tags is None:
       return
@@ -686,16 +818,25 @@ class AppStreamSimulator:
     for tag_key in tag_keys:
       existing_tags.pop(tag_key, None)
 
-  def list_tags_for_resource(self, *, resource_arn: str) -> dict[str, typing.Any]:
+  def list_tags_for_resource(
+    self,
+    *,
+    region_name: str | None = None,
+    resource_arn: str,
+  ) -> dict[str, typing.Any]:
     """Return tags for one fleet or stack ARN."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
 
-    return {"Tags": dict(self._tags_by_arn.get(resource_arn, {}))}
+    self._apply_due_transitions(resolved_region_name)
+
+    return {"Tags": dict(regional_state.tags_by_arn.get(resource_arn, {}))}
 
   def describe_images(
     self,
     *,
+    region_name: str | None = None,
     names: list[str] | None = None,
     arns: list[str] | None = None,
     next_token: str | None = None,
@@ -703,11 +844,13 @@ class AppStreamSimulator:
   ) -> dict[str, typing.Any]:
     """Return image objects visible in the simulator."""
 
+    regional_state = self._regional_state(region_name)
+
     if arns is not None:
       image_objects = []
 
       for image_arn in arns:
-        image_object = self._image_objects_by_arn.get(image_arn)
+        image_object = regional_state.image_objects_by_arn.get(image_arn)
 
         if image_object is not None:
           image_objects.append(image_object)
@@ -718,14 +861,14 @@ class AppStreamSimulator:
       image_objects = []
 
       for image_name in names:
-        image_object = self._image_objects_by_name.get(image_name)
+        image_object = regional_state.image_objects_by_name.get(image_name)
 
         if image_object is not None:
           image_objects.append(image_object)
 
       return {"Images": image_objects}
 
-    image_objects = list(self._image_objects_by_name.values())
+    image_objects = list(regional_state.image_objects_by_name.values())
 
     return self._build_paginated_object_list_response(
       collection_key="Images",
@@ -733,12 +876,20 @@ class AppStreamSimulator:
       next_token=next_token,
     )
 
-  def update_fleet(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
+  def update_fleet(
+    self,
+    *,
+    region_name: str | None = None,
+    **keyword_arguments: typing.Any,
+  ) -> dict[str, typing.Any]:
     """Update one fleet display name or image name."""
 
-    self._apply_due_transitions()
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+
+    self._apply_due_transitions(resolved_region_name)
     fleet_name = keyword_arguments["Name"]
-    fleet_record = self._require_fleet(fleet_name)
+    fleet_record = self._require_fleet(fleet_name, regional_state=regional_state)
 
     if "DisplayName" in keyword_arguments:
       fleet_record.display_name = keyword_arguments["DisplayName"]
@@ -754,6 +905,7 @@ class AppStreamSimulator:
   def seed_image(
     self,
     *,
+    region_name: str | None = None,
     image_name: str,
     application_names: list[str] | None = None,
     image_type: str = "CUSTOM",
@@ -762,9 +914,11 @@ class AppStreamSimulator:
   ) -> None:
     """Insert one image catalog row without API calls (test helper)."""
 
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
     resolved_application_names = application_names or ["Fortnite"]
     resolved_image_arn = image_arn or "arn:aws:appstream:{region}:{account}:image/{image_name}".format(
-      region=self._config.region_name,
+      region=resolved_region_name,
       account=self._config.account_id,
       image_name=image_name,
     )
@@ -779,12 +933,13 @@ class AppStreamSimulator:
       ],
     }
 
-    self._image_objects_by_name[image_name] = image_object
-    self._image_objects_by_arn[resolved_image_arn] = image_object
+    regional_state.image_objects_by_name[image_name] = image_object
+    regional_state.image_objects_by_arn[resolved_image_arn] = image_object
 
   def seed_session(
     self,
     *,
+    region_name: str | None = None,
     session_id: str,
     stack_name: str,
     fleet_name: str,
@@ -793,7 +948,9 @@ class AppStreamSimulator:
   ) -> None:
     """Insert one session row without API calls (test helper)."""
 
-    self._sessions.append(
+    regional_state = self._regional_state(region_name)
+
+    regional_state.sessions.append(
       _SessionRecord(
         session_id=session_id,
         stack_name=stack_name,
@@ -806,6 +963,7 @@ class AppStreamSimulator:
   def seed_fleet(
     self,
     *,
+    region_name: str | None = None,
     fleet_name: str,
     display_name: str | None = None,
     state: str = "RUNNING",
@@ -813,8 +971,10 @@ class AppStreamSimulator:
   ) -> None:
     """Insert one fleet without API calls (test helper)."""
 
-    fleet_arn = self._build_fleet_arn(fleet_name)
-    self._fleets[fleet_name] = _FleetRecord(
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+    fleet_arn = self._build_fleet_arn(fleet_name, region_name=resolved_region_name)
+    regional_state.fleets[fleet_name] = _FleetRecord(
       name=fleet_name,
       arn=fleet_arn,
       display_name=display_name or fleet_name,
@@ -823,19 +983,22 @@ class AppStreamSimulator:
       image_name="seed-image",
       instance_type="stream.standard.medium",
     )
-    self.seed_image(image_name="seed-image")
+    self.seed_image(region_name=resolved_region_name, image_name="seed-image")
 
   def seed_stack(
     self,
     *,
+    region_name: str | None = None,
     stack_name: str,
     display_name: str | None = None,
     state: str = "AVAILABLE",
   ) -> None:
     """Insert one stack without API calls (test helper)."""
 
-    stack_arn = self._build_stack_arn(stack_name)
-    self._stacks[stack_name] = _StackRecord(
+    regional_state = self._regional_state(region_name)
+    resolved_region_name = self._resolve_region_name(region_name)
+    stack_arn = self._build_stack_arn(stack_name, region_name=resolved_region_name)
+    regional_state.stacks[stack_name] = _StackRecord(
       name=stack_name,
       arn=stack_arn,
       display_name=display_name or stack_name,

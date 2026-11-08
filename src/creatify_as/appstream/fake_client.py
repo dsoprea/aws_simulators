@@ -13,18 +13,17 @@ class FakeAppStreamClientMeta:
 
 
 class FakeAppStreamClient:
-  """Delegates boto AppStream calls to one AppStreamSimulator instance."""
+  """Delegates boto AppStream calls to one AppStreamSimulator instance in one region."""
 
   def __init__(
     self,
     simulator: creatify_as.appstream.simulator.AppStreamSimulator,
     *,
-    region_name: str | None = None,
+    region_name: str = "us-east-1",
   ) -> None:
     self._simulator = simulator
-    self.meta = FakeAppStreamClientMeta(
-      region_name or simulator._config.region_name,
-    )
+    self._region_name = region_name
+    self.meta = FakeAppStreamClientMeta(region_name)
     self.associate_fleet_calls: list[dict[str, typing.Any]] = []
     self.disassociate_fleet_calls: list[dict[str, typing.Any]] = []
     self.create_streaming_url_calls: list[dict[str, typing.Any]] = []
@@ -42,6 +41,7 @@ class FakeAppStreamClient:
   def associate_fleet(self, **keyword_arguments: typing.Any) -> None:
     self.associate_fleet_calls.append(keyword_arguments)
     self._simulator.associate_fleet(
+      region_name=self._region_name,
       fleet_name=keyword_arguments["FleetName"],
       stack_name=keyword_arguments["StackName"],
     )
@@ -49,18 +49,21 @@ class FakeAppStreamClient:
   def disassociate_fleet(self, **keyword_arguments: typing.Any) -> None:
     self.disassociate_fleet_calls.append(keyword_arguments)
     self._simulator.disassociate_fleet(
+      region_name=self._region_name,
       fleet_name=keyword_arguments["FleetName"],
       stack_name=keyword_arguments["StackName"],
     )
 
   def list_associated_stacks(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     return self._simulator.list_associated_stacks(
+      region_name=self._region_name,
       fleet_name=keyword_arguments["FleetName"],
       next_token=keyword_arguments.get("NextToken"),
     )
 
   def list_associated_fleets(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     return self._simulator.list_associated_fleets(
+      region_name=self._region_name,
       stack_name=keyword_arguments["StackName"],
       next_token=keyword_arguments.get("NextToken"),
     )
@@ -69,6 +72,7 @@ class FakeAppStreamClient:
     self.create_streaming_url_calls.append(keyword_arguments)
 
     return self._simulator.create_streaming_url(
+      region_name=self._region_name,
       stack_name=keyword_arguments["StackName"],
       fleet_name=keyword_arguments["FleetName"],
       user_id=keyword_arguments["UserId"],
@@ -81,6 +85,7 @@ class FakeAppStreamClient:
     self.describe_fleets_calls.append(keyword_arguments)
 
     return self._simulator.describe_fleets(
+      region_name=self._region_name,
       names=keyword_arguments.get("Names"),
       next_token=keyword_arguments.get("NextToken"),
     )
@@ -89,6 +94,7 @@ class FakeAppStreamClient:
     self.describe_stacks_calls.append(keyword_arguments)
 
     return self._simulator.describe_stacks(
+      region_name=self._region_name,
       names=keyword_arguments.get("Names"),
       next_token=keyword_arguments.get("NextToken"),
     )
@@ -96,29 +102,30 @@ class FakeAppStreamClient:
   def create_fleet(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     self.create_fleet_calls.append(keyword_arguments)
 
-    return self._simulator.create_fleet(**keyword_arguments)
+    return self._simulator.create_fleet(region_name=self._region_name, **keyword_arguments)
 
   def start_fleet(self, **keyword_arguments: typing.Any) -> None:
     self.start_fleet_calls.append(keyword_arguments)
-    self._simulator.start_fleet(name=keyword_arguments["Name"])
+    self._simulator.start_fleet(region_name=self._region_name, name=keyword_arguments["Name"])
 
   def stop_fleet(self, **keyword_arguments: typing.Any) -> None:
     self.stop_fleet_calls.append(keyword_arguments)
-    self._simulator.stop_fleet(name=keyword_arguments["Name"])
+    self._simulator.stop_fleet(region_name=self._region_name, name=keyword_arguments["Name"])
 
   def delete_fleet(self, **keyword_arguments: typing.Any) -> None:
-    self._simulator.delete_fleet(name=keyword_arguments["Name"])
+    self._simulator.delete_fleet(region_name=self._region_name, name=keyword_arguments["Name"])
 
   def create_stack(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
-    return self._simulator.create_stack(**keyword_arguments)
+    return self._simulator.create_stack(region_name=self._region_name, **keyword_arguments)
 
   def delete_stack(self, **keyword_arguments: typing.Any) -> None:
-    self._simulator.delete_stack(name=keyword_arguments["Name"])
+    self._simulator.delete_stack(region_name=self._region_name, name=keyword_arguments["Name"])
 
   def describe_sessions(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     self.describe_sessions_calls.append(keyword_arguments)
 
     return self._simulator.describe_sessions(
+      region_name=self._region_name,
       stack_name=keyword_arguments["StackName"],
       fleet_name=keyword_arguments["FleetName"],
       user_id=keyword_arguments.get("UserId"),
@@ -127,11 +134,15 @@ class FakeAppStreamClient:
     )
 
   def expire_session(self, **keyword_arguments: typing.Any) -> None:
-    self._simulator.expire_session(session_id=keyword_arguments["SessionId"])
+    self._simulator.expire_session(
+      region_name=self._region_name,
+      session_id=keyword_arguments["SessionId"],
+    )
 
   def tag_resource(self, **keyword_arguments: typing.Any) -> None:
     self.tag_resource_calls.append(keyword_arguments)
     self._simulator.tag_resource(
+      region_name=self._region_name,
       resource_arn=keyword_arguments["ResourceArn"],
       tags=keyword_arguments["Tags"],
     )
@@ -139,12 +150,14 @@ class FakeAppStreamClient:
   def untag_resource(self, **keyword_arguments: typing.Any) -> None:
     self.untag_resource_calls.append(keyword_arguments)
     self._simulator.untag_resource(
+      region_name=self._region_name,
       resource_arn=keyword_arguments["ResourceArn"],
       tag_keys=keyword_arguments["TagKeys"],
     )
 
   def list_tags_for_resource(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     return self._simulator.list_tags_for_resource(
+      region_name=self._region_name,
       resource_arn=keyword_arguments["ResourceArn"],
     )
 
@@ -152,6 +165,7 @@ class FakeAppStreamClient:
     self.describe_images_calls.append(keyword_arguments)
 
     return self._simulator.describe_images(
+      region_name=self._region_name,
       names=keyword_arguments.get("Names"),
       arns=keyword_arguments.get("Arns"),
       next_token=keyword_arguments.get("NextToken"),
@@ -161,4 +175,4 @@ class FakeAppStreamClient:
   def update_fleet(self, **keyword_arguments: typing.Any) -> dict[str, typing.Any]:
     self.update_fleet_calls.append(keyword_arguments)
 
-    return self._simulator.update_fleet(**keyword_arguments)
+    return self._simulator.update_fleet(region_name=self._region_name, **keyword_arguments)
