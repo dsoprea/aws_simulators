@@ -81,7 +81,7 @@ def test_resolve_vpc_config_uses_builtin_defaults(monkeypatch: pytest.MonkeyPatc
 def test_build_vpc_config_from_launch_parameters_orders_and_caps_subnets() -> None:
   launch_parameters = {
     "SUBNET_ID": "subnet-primary",
-    "PUBLIC_SUBNET_IDS_BY_AZ": json.dumps(
+    "SUBNET_IDS_BY_AZ": json.dumps(
       {
         "us-east-1a": "subnet-primary",
         "us-east-1b": "subnet-b",
@@ -120,7 +120,7 @@ def test_resolve_vpc_config_uses_explicit_environment(monkeypatch: pytest.Monkey
 
 def test_parse_launch_parameters_from_body_text_handles_quoted_json() -> None:
   body_text = (
-    'PUBLIC_SUBNET_IDS_BY_AZ="{\\"us-east-1a\\":\\"subnet-quoted\\"}"\n'
+    'SUBNET_IDS_BY_AZ="{\\"us-east-1a\\":\\"subnet-quoted\\"}"\n'
     "SECURITY_GROUP_IDS_SPACE_SEPARATED=sg-quoted\n"
     "SUBNET_ID=subnet-quoted\n"
   )
@@ -131,7 +131,7 @@ def test_parse_launch_parameters_from_body_text_handles_quoted_json() -> None:
 
   assert launch_parameters["SUBNET_ID"] == "subnet-quoted"
   assert launch_parameters["SECURITY_GROUP_IDS_SPACE_SEPARATED"] == "sg-quoted"
-  assert '"us-east-1a"' in launch_parameters["PUBLIC_SUBNET_IDS_BY_AZ"]
+  assert '"us-east-1a"' in launch_parameters["SUBNET_IDS_BY_AZ"]
 
 
 def test_poll_image_until_state_times_out(monkeypatch: pytest.MonkeyPatch) -> None:

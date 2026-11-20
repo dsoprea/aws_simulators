@@ -22,7 +22,7 @@ AWSIM_SUBNET_IDS_ENVIRONMENT_VARIABLE_NAME = "AWSIM_SUBNET_IDS"
 AWSIM_SECURITY_GROUP_IDS_ENVIRONMENT_VARIABLE_NAME = "AWSIM_SECURITY_GROUP_IDS"
 LAUNCH_ENV_FILEPATH_ENVIRONMENT_VARIABLE_NAME = "LAUNCH_ENV_FILEPATH"
 DEPLOYMENT_ENVIRONMENT_ENVIRONMENT_VARIABLE_NAME = "DEPLOYMENT_ENVIRONMENT"
-LAUNCH_ENV_PUBLIC_SUBNET_IDS_BY_AZ_KEY = "PUBLIC_SUBNET_IDS_BY_AZ"
+LAUNCH_ENV_SUBNET_IDS_BY_AZ_KEY = "SUBNET_IDS_BY_AZ"
 LAUNCH_ENV_SECURITY_GROUP_IDS_SPACE_SEPARATED_KEY = "SECURITY_GROUP_IDS_SPACE_SEPARATED"
 LAUNCH_ENV_SUBNET_ID_KEY = "SUBNET_ID"
 DEFAULT_AWA_AMI_IMPORT_IAM_ROLE_NAME_SUFFIX = "creatify-awa-ami-import"
@@ -261,13 +261,13 @@ def load_launch_parameters_from_env_file_path(launch_env_filepath: str) -> dict[
 
 
 def _validate_public_subnet_ids_by_az_blob(map_blob: str) -> dict[str, object]:
-  """Reject empty, malformed, or all-blank ``PUBLIC_SUBNET_IDS_BY_AZ`` export JSON."""
+  """Reject empty, malformed, or all-blank ``SUBNET_IDS_BY_AZ`` export JSON."""
 
   stripped_map_blob = map_blob.strip()
 
   if not stripped_map_blob:
     raise ValueError(
-      "PUBLIC_SUBNET_IDS_BY_AZ must be nonempty JSON in launch.env "
+      "SUBNET_IDS_BY_AZ must be nonempty JSON in launch.env "
       "(object mapping each availability zone name to a subnet id).",
     )
 
@@ -275,14 +275,14 @@ def _validate_public_subnet_ids_by_az_blob(map_blob: str) -> dict[str, object]:
     deserialized_plaintext = json.loads(stripped_map_blob)
   except json.JSONDecodeError as json_decode_error:
     raise ValueError(
-      "PUBLIC_SUBNET_IDS_BY_AZ must be valid JSON (got {map_blob!r})".format(
+      "SUBNET_IDS_BY_AZ must be valid JSON (got {map_blob!r})".format(
         map_blob=stripped_map_blob,
       ),
     ) from json_decode_error
 
   if not isinstance(deserialized_plaintext, dict):
     raise ValueError(
-      "PUBLIC_SUBNET_IDS_BY_AZ must be a JSON object mapping AZ names to subnet ids; "
+      "SUBNET_IDS_BY_AZ must be a JSON object mapping AZ names to subnet ids; "
       "got type {type_name}".format(type_name=type(deserialized_plaintext).__name__),
     )
 
@@ -296,7 +296,7 @@ def _validate_public_subnet_ids_by_az_blob(map_blob: str) -> dict[str, object]:
 
   if nonempty_subnet_value_count == 0:
     raise ValueError(
-      "PUBLIC_SUBNET_IDS_BY_AZ must list at least one nonempty subnet id "
+      "SUBNET_IDS_BY_AZ must list at least one nonempty subnet id "
       "(JSON keys are availability zone names).",
     )
 
@@ -304,7 +304,7 @@ def _validate_public_subnet_ids_by_az_blob(map_blob: str) -> dict[str, object]:
 
 
 def derive_ordered_subnet_candidates(launch_parameters: dict[str, str]) -> list[str]:
-  """Prefer ``SUBNET_ID`` then alphabetical AZ-key subnets from ``PUBLIC_SUBNET_IDS_BY_AZ``."""
+  """Prefer ``SUBNET_ID`` then alphabetical AZ-key subnets from ``SUBNET_IDS_BY_AZ``."""
 
   ordered: list[str] = []
   primary_subnet = launch_parameters.get(LAUNCH_ENV_SUBNET_ID_KEY, "").strip()
@@ -312,7 +312,7 @@ def derive_ordered_subnet_candidates(launch_parameters: dict[str, str]) -> list[
   if primary_subnet:
     ordered.append(primary_subnet)
 
-  map_blob = launch_parameters[LAUNCH_ENV_PUBLIC_SUBNET_IDS_BY_AZ_KEY]
+  map_blob = launch_parameters[LAUNCH_ENV_SUBNET_IDS_BY_AZ_KEY]
   deserialized_plaintext = _validate_public_subnet_ids_by_az_blob(map_blob)
   subnet_identifier_values_from_availability_zone_object: set[str] = set()
   availability_zone_keys_sorted = sorted(deserialized_plaintext.keys())
@@ -329,7 +329,7 @@ def derive_ordered_subnet_candidates(launch_parameters: dict[str, str]) -> list[
   if primary_subnet:
     if primary_subnet not in subnet_identifier_values_from_availability_zone_object:
       raise ValueError(
-        "SUBNET_ID={primary_subnet!r} must appear as a subnet id value inside PUBLIC_SUBNET_IDS_BY_AZ".format(
+        "SUBNET_ID={primary_subnet!r} must appear as a subnet id value inside SUBNET_IDS_BY_AZ".format(
           primary_subnet=primary_subnet,
         ),
       )
